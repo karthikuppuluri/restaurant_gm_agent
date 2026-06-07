@@ -1,7 +1,7 @@
-# CLAUDE.md — Matchday GM
+# CLAUDE.md — Restaurant GM
 
 Hand-off doc for Claude Code. **Read this fully before touching the repo.**
-`DATA_MODEL.md` is the source of truth for the schema; this file is the source
+`README.md` is the source of truth for the schema; this file is the source
 of truth for how to behave and what not to break.
 
 ---
