@@ -1,5 +1,11 @@
 # Restaurant GM — Data Model
 
+## TODO
+- [ ] Establish MIT License (hackathon requirement)
+- [ ] Order start times should follow a statistical distribution (e.g. lunch/dinner peaks) rather than uniform random
+
+---
+
 Scope: four reasoning agents (**Inventory, Order-mgmt, Billing, Outreach**) plus a
 **Central orchestrator**. No seating, staffing, or live-sports agents. All data
 is simulated.
