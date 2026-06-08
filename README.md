@@ -32,10 +32,11 @@ The live "orders coming in" behavior is driven by **MongoDB Change Streams**: a
 simulated order inserted -> the stream fires -> agents react and the serving
 layer updates -> the dashboard refreshes.
 
-**Plumbing vs. reasoning.** Two things are deterministic functions, NOT LLM
+**Plumbing vs. reasoning.** Three things are deterministic functions, NOT LLM
 steps: (1) order ingestion + **BOM-based stock depletion** (when an order lands,
-a function reads the static recipe and decrements `raw_ingredients`), and (2)
-base metric rollups (revenue, covers). Agents reason over the *results*: Inventory
+a function reads the static recipe and decrements `raw_ingredients`), (2)
+base metric rollups (revenue, covers), and (3) redemption reconciliation
+(`campaign_sends.redeemed` joined back to `orders`). Agents reason over the *results*: Inventory
 decides reorders and derives the 86 list, Order-mgmt analyzes the sales stream,
 Billing computes margin/feasibility and builds + predicts promo recommendations,
 Outreach targets opted-in customers and records sends (redemption reconciliation is
@@ -85,7 +86,7 @@ flowchart TB
 
   %% ---- orchestration + decisions ----
   TRIG{"CENTRAL: worth<br/>evaluating a promo now?"}:::decision
-  CENTRAL["🧠 CENTRAL ORCHESTRATOR — Manager + ReAct<br/>tools: call sub-agents · update(recommendation.status) · log<br/>touches: agent_events, promotion_recommendations"]:::central
+  CENTRAL["🧠 CENTRAL ORCHESTRATOR — Manager + ReAct<br/>tools: AgentTool(4 specialists) · update(recommendation.status) · log<br/>touches: agent_events, promotion_recommendations"]:::central
   QGATE{"CENTRAL: justification<br/>real &amp; complete? (source_table)"}:::decision
   APPROVE{"👤 HUMAN:<br/>approve promo?"}:::decision
   IDLE([idle / wait]):::term
