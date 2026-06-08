@@ -989,7 +989,7 @@ PRICING_RULES = [
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CUSTOMERS  (50 simulated guests with RFM)
+# CUSTOMERS  (50 simulated guests with demographics + RFM)
 # ──────────────────────────────────────────────────────────────────────────────
 _FIRST = [
     "Alex", "Sam", "Jordan", "Taylor", "Morgan", "Casey", "Riley", "Avery",
@@ -1004,54 +1004,60 @@ _LAST = [
     "Sanchez", "Clark", "Lewis", "Robinson", "Walker", "Hall", "Young", "Allen",
 ]
 
-_SEGMENT_POOL = (
-    ["regular"] * 20 + ["match_day_only"] * 13 + ["big_spender"] * 7 + ["lapsed"] * 10
-)
-_TIER_POOL = ["none"] * 25 + ["silver"] * 17 + ["gold"] * 8
+# (city, state, zip)
+_LOCATIONS = [
+    ("Chicago", "IL", "60601"),
+    ("Chicago", "IL", "60614"),
+    ("Chicago", "IL", "60622"),
+    ("Chicago", "IL", "60647"),
+    ("Chicago", "IL", "60657"),
+    ("Evanston", "IL", "60201"),
+    ("Oak Park", "IL", "60301"),
+    ("Naperville", "IL", "60540"),
+]
 
-_ITEM_IDS = [m["item_id"] for m in MENU_ITEMS]
-
-_RFM_BY_SEGMENT = {
-    #                recency   freq_90d  ltv_cents_range   avg_check_range  price_sens
-    "regular":      (1,  14,   4,  12,   5000,  25000,    800,  2500,  0.3, 0.7),
-    "match_day_only":(7, 30,   1,   4,   2000,  10000,   1000,  3000,  0.4, 0.8),
-    "big_spender":  (1,  14,   5,  15,  20000, 100000,   2000,  6000,  0.1, 0.4),
-    "lapsed":       (30, 90,   0,   2,   1000,   8000,    500,  2000,  0.5, 0.9),
-}
+_GENDERS     = ["M", "F", "other", "prefer_not_to_say"]
+_GENDER_W    = [45, 45, 5, 5]
+_TIER_POOL   = ["none"] * 25 + ["silver"] * 17 + ["gold"] * 8
+_DIET_OPTIONS = ["vegetarian", "gluten_free", "vegan", "halal", "none"]
+_ITEM_IDS    = [m["item_id"] for m in MENU_ITEMS]
 
 
 def _generate_customers():
     random.seed(SEED + 1)
     customers = []
-    segment_pool = _SEGMENT_POOL[:]
     tier_pool = _TIER_POOL[:]
-    random.shuffle(segment_pool)
     random.shuffle(tier_pool)
 
     for i in range(50):
         hex_id = format(random.randint(0, 0xFFFFFF), "06x")
         cust_id = f"cust_{hex_id}"
         first = _FIRST[i % len(_FIRST)]
-        last = _LAST[i % len(_LAST)]
-        segment = segment_pool[i]
-        tier = tier_pool[i]
+        last  = _LAST[i % len(_LAST)]
+        city, state, zip_code = random.choice(_LOCATIONS)
 
-        rec_lo, rec_hi, frq_lo, frq_hi, ltv_lo, ltv_hi, chk_lo, chk_hi, ps_lo, ps_hi = (
-            _RFM_BY_SEGMENT[segment]
-        )
+        # dietary flags: most have "none", some have 1 real flag
+        if random.random() < 0.25:
+            dietary_flags = [random.choice(_DIET_OPTIONS[:-1])]  # exclude "none"
+        else:
+            dietary_flags = ["none"]
 
         customers.append({
             "_id": cust_id,
             "customer_id": cust_id,
             "name": f"{first} {last}",
             "email_masked": f"{first.lower()}.{last.lower()}@•••.com",
-            "segment": segment,
-            "recency_days": random.randint(rec_lo, rec_hi),
-            "frequency_90d": random.randint(frq_lo, frq_hi),
-            "lifetime_value_money": money(random.randint(ltv_lo, ltv_hi)),
-            "avg_check_money": money(random.randint(chk_lo, chk_hi)),
-            "price_sensitivity": round(random.uniform(ps_lo, ps_hi), 2),
-            "loyalty_tier": tier,
+            "age": random.randint(18, 65),
+            "gender": random.choices(_GENDERS, weights=_GENDER_W)[0],
+            "city": city,
+            "state": state,
+            "zip_code": zip_code,
+            "dietary_flags": dietary_flags,
+            "recency_days": random.randint(1, 60),
+            "lifetime_value_money": money(random.randint(1000, 80000)),
+            "avg_check_money": money(random.randint(600, 5000)),
+            "price_sensitivity": round(random.uniform(0.1, 0.9), 2),
+            "loyalty_tier": tier_pool[i],
             "opt_in_marketing": random.random() < 0.65,
             "favorite_item_ids": random.sample(_ITEM_IDS, k=random.randint(1, 3)),
             **audit(),
