@@ -38,7 +38,8 @@ a function reads the static recipe and decrements `raw_ingredients`), and (2)
 base metric rollups (revenue, covers). Agents reason over the *results*: Inventory
 decides reorders and derives the 86 list, Order-mgmt analyzes the sales stream,
 Billing computes margin/feasibility and builds + predicts promo recommendations,
-Outreach targets and tracks sends.
+Outreach targets opted-in customers and records sends (redemption reconciliation is
+plumbing).
 
 **86 status is derived, never stored on `menu_items`.** An item is unavailable
 when the ingredients its recipe needs fall below threshold; the Inventory agent
@@ -58,6 +59,14 @@ trigger) is plain code with no LLM and is omitted here — see the prose above.
 | **ReAct** (reason → act → observe → loop) | Central, Billing | Next action depends on the last observation |
 | **Evaluator–Optimizer** (generate → self-check → refine) | Billing | Must validate a promo against guardrails before surfacing |
 | **Workflow** (fixed steps / single judgment call) | Inventory, Order-mgmt, Outreach | Deterministic-ish tasks; a loop adds no value |
+
+Each specialist is an ADK `LlmAgent` that reaches MongoDB **through the MongoDB MCP
+server** — the agent composes `find` / `aggregate` calls and interprets the results,
+but the **arithmetic runs server-side in aggregation pipelines, never in the model**
+(invariant #3). The only deterministic, driver-based (non-MCP) code is the
+high-frequency, per-order **plumbing**: order ingestion + BOM depletion, base-metric
+rollups, and redemption reconciliation. Agent configs live in
+[`restaurant_gm/*.yaml`](restaurant_gm/) (`root_agent.yaml` is Central).
 
 The diagram shows each agent, the **tool calls** it makes (expressed as
 `find / aggregate / insert / update`), the **data sources** those calls touch
@@ -88,7 +97,7 @@ flowchart TB
   REORDER{"INVENTORY:<br/>stock &lt; reorder_point?"}:::decision
   BIL["💳 BILLING — ReAct + Evaluator–Optimizer<br/>find/aggregate(orders, menu_items, recipes,<br/>raw_ingredients, pricing_rules, customers)<br/>insert(promotion_recommendations, promotions, financials)<br/>update(live_metrics)"]:::agent
   FEAS{"BILLING: within guardrails?<br/>margin≥min · discount≤max · not blackout"}:::decision
-  OUT["📣 OUTREACH — workflow / criteria-based targeting<br/>find(customers by target_criteria, promotions, recommendations)<br/>insert/update(campaign_sends)"]:::agent
+  OUT["📣 OUTREACH — workflow / criteria-based targeting<br/>find(customers by target_criteria, promotions, recommendations)<br/>insert(campaign_sends) · reconciliation = plumbing"]:::agent
 
   %% ---- data access layer ----
   MCP[["🍃 MongoDB MCP server<br/>find · aggregate · insert-many · update-many<br/>(per-agent tool_filter)"]]:::mcp
@@ -325,8 +334,10 @@ The Inventory agent's reorders to vendors. Written by Inventory.
 | `created_by` | string | `agent:inventory` |
 
 ## `campaign_sends`
-Every outreach push, and whether it was redeemed. Written by Outreach. This is
-how *actual* uptake is measured (join `redeemed_order_id` back to `orders`).
+Every outreach push, and whether it was redeemed. **Inserted by Outreach** (the push);
+`redeemed` / `redeemed_order_id` are **reconciled by plumbing** (high-frequency,
+event-driven — invariant #3). This is how *actual* uptake is measured (join
+`redeemed_order_id` back to `orders`).
 
 | Field | Type | Notes |
 |---|---|---|
@@ -406,7 +417,7 @@ Central on the human's yes/no.
 
 ## `promotions` (approved / live)
 Created when a recommendation is approved. Written/configured by Billing; read
-by Outreach to push. `redemption_count` reconciled from `campaign_sends`/`orders`.
+by Outreach to push. `redemption_count` reconciled from `campaign_sends`/`orders` by plumbing.
 
 | Field | Type | Notes |
 |---|---|---|
@@ -419,7 +430,7 @@ by Outreach to push. `redemption_count` reconciled from `campaign_sends`/`orders
 | `status` | enum | `live` \| `scheduled` \| `expired` |
 | `valid_from` / `valid_until` | timestamp | |
 | `predicted_uptake` | float | Carried from the recommendation |
-| `redemption_count` | int | Actual, reconciled |
+| `redemption_count` | int | Actual, reconciled by plumbing |
 | `approved_by` | string | |
 
 ---
@@ -488,6 +499,6 @@ promotions.recommendation_id ──────► promotion_recommendations.rec
 | **Inventory** | raw_ingredients, recipes, vendors, orders (velocity) | purchase_orders, live_metrics (low_stock + 86), agent_events |
 | **Order-mgmt** | orders, menu_items | live_metrics (sales pace, top movers), agent_events |
 | **Billing** | orders, menu_items, recipes, raw_ingredients, pricing_rules, customers (demographics + behavioral signals) | promotion_recommendations, promotions, live_metrics (margins), financials, agent_events |
-| **Outreach** | customers, promotion_recommendations, promotions | campaign_sends, agent_events |
+| **Outreach** | customers, promotion_recommendations, promotions | campaign_sends (sends/pushes), agent_events |
 | **Central** | agent_events | promotion_recommendations (status on approval), agent_events |
-| **Pipeline (plumbing)** | recipes (for depletion) | orders, raw_ingredients (deplete/replenish), live_metrics (base) |
+| **Pipeline (plumbing)** | recipes (for depletion), campaign_sends + orders (for reconciliation) | orders, raw_ingredients (deplete/replenish), live_metrics (base), campaign_sends (redemption reconciliation) |
