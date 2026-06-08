@@ -123,19 +123,23 @@ and Billing (stock feasibility).
 ```
 
 ## `customers` (CRM)
-Guest profiles + RFM. Read by Billing (segments, prediction) and Outreach
-(targeting, opt-in).
+Guest profiles with demographics and behavioral signals. Read by Billing
+(prediction, targeting) and Outreach (targeting, opt-in).
 
 | Field | Type | Notes |
 |---|---|---|
 | `customer_id` | string | PK, e.g. `cust_8a3f2c` |
 | `name` / `email_masked` | string | PII masked |
-| `segment` | enum | `regular` \| `match_day_only` \| `big_spender` \| `lapsed` |
-| `recency_days` | int | R |
-| `frequency_90d` | int | F |
-| `lifetime_value_money` | Money | M |
-| `avg_check_money` | Money | |
-| `price_sensitivity` | float | 0–1, drives prediction |
+| `age` | int | |
+| `gender` | enum | `M` \| `F` \| `other` \| `prefer_not_to_say` |
+| `city` | string | e.g. `"Chicago"` |
+| `state` | string | 2-letter, e.g. `"IL"` |
+| `zip_code` | string | |
+| `dietary_flags` | string[] | `vegetarian`, `gluten_free`, `vegan`, `halal`, `none` |
+| `recency_days` | int | Days since last visit (RFM — R) |
+| `lifetime_value_money` | Money | Total spend to date (RFM — M) |
+| `avg_check_money` | Money | Average order value |
+| `price_sensitivity` | float | 0–1, drives promo uptake prediction |
 | `loyalty_tier` | enum | `none` \| `silver` \| `gold` |
 | `opt_in_marketing` | bool | Outreach may only target `true` |
 | `favorite_item_ids` | FK[]->menu_items | |
@@ -272,7 +276,7 @@ Central on the human's yes/no.
 |---|---|---|
 | `recommendation_id` | string | PK, e.g. `rec_77` |
 | `status` | enum | `pending` \| `approved` \| `rejected` \| `expired` |
-| `proposal` | obj | `{ title, description, discount_type, discount_value, applies_to_item_ids[], target_segments[] }` |
+| `proposal` | obj | `{ title, description, discount_type, discount_value, applies_to_item_ids[], target_criteria{} }` |
 | `justification.analytical` | obj[] | `{ metric, value, source_table, note }` — the real-data evidence |
 | `justification.predictive` | obj | `{ predicted_uptake, predicted_incremental_revenue_money, predicted_margin_after_pct, confidence, model_note }` |
 | `decided_by` / `decided_at` | string/ts | The human + when |
@@ -288,20 +292,20 @@ Central on the human's yes/no.
     "description": "Push the highest-margin drink while the room is full.",
     "discount_type": "PERCENTAGE", "discount_value": 20,
     "applies_to_item_ids": ["cat_item_lager_01"],
-    "target_segments": ["match_day_only", "regular"]
+    "target_criteria": { "loyalty_tier": ["silver", "gold"], "max_price_sensitivity": 0.6, "city": "Chicago" }
   },
   "justification": {
     "analytical": [
       { "metric": "lager gross margin", "value": "77%", "source_table": "menu_items+recipes", "note": "even at 20% off, margin stays 71%" },
       { "metric": "current stock cover", "value": "~3.5 hrs", "source_table": "raw_ingredients", "note": "240 pints on hand" },
-      { "metric": "opted-in target size", "value": "138 customers", "source_table": "customers", "note": "match_day_only + regular, opt_in only" }
+      { "metric": "opted-in target size", "value": "138 customers", "source_table": "customers", "note": "silver/gold loyalty, price_sensitivity < 0.6, Chicago, opt_in only" }
     ],
     "predictive": {
       "predicted_uptake": 0.34,
       "predicted_incremental_revenue_money": { "amount": 21500, "currency": "USD" },
       "predicted_margin_after_pct": 71,
       "confidence": 0.62,
-      "model_note": "uptake scaled by segment price_sensitivity"
+      "model_note": "uptake scaled by price_sensitivity and loyalty_tier"
     }
   },
   "decided_by": null, "decided_at": null, "resulting_promo_id": null,
@@ -321,7 +325,7 @@ by Outreach to push. `redemption_count` reconciled from `campaign_sends`/`orders
 | `title` / `description` | string | |
 | `discount_type` / `discount_value` | enum/int | |
 | `applies_to_item_ids` | FK[]->menu_items | |
-| `target_segments` | enum[] | |
+| `target_criteria` | obj | Agent-determined targeting (loyalty_tier, city, age range, dietary_flags, etc.) |
 | `status` | enum | `live` \| `scheduled` \| `expired` |
 | `valid_from` / `valid_until` | timestamp | |
 | `predicted_uptake` | float | Carried from the recommendation |
@@ -393,7 +397,7 @@ promotions.recommendation_id ──────► promotion_recommendations.rec
 |---|---|---|
 | **Inventory** | raw_ingredients, recipes, vendors, orders (velocity) | purchase_orders, live_metrics (low_stock + 86), agent_events |
 | **Order-mgmt** | orders, menu_items | live_metrics (sales pace, top movers), agent_events |
-| **Billing** | orders, menu_items, recipes, raw_ingredients, pricing_rules, customers | promotion_recommendations, promotions, live_metrics (margins), financials, agent_events |
+| **Billing** | orders, menu_items, recipes, raw_ingredients, pricing_rules, customers (demographics + behavioral signals) | promotion_recommendations, promotions, live_metrics (margins), financials, agent_events |
 | **Outreach** | customers, promotion_recommendations, promotions | campaign_sends, agent_events |
 | **Central** | agent_events | promotion_recommendations (status on approval), agent_events |
 | **Pipeline (plumbing)** | recipes (for depletion) | orders, raw_ingredients (deplete/replenish), live_metrics (base) |
