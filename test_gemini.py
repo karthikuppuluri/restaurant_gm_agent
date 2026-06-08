@@ -6,7 +6,6 @@ from google import genai
 # print("env api key: ", os.environ['GOOGLE_API_KEY'])
 
 client = genai.Client(
-    vertexai=True,
     project=os.environ['GOOGLE_CLOUD_PROJECT'],
     location=os.environ['GOOGLE_CLOUD_LOCATION'],
 )

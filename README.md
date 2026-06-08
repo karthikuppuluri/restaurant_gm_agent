@@ -46,6 +46,90 @@ computes this from `raw_ingredients` + `recipes` and publishes it to `live_metri
 
 ---
 
+# Agent architecture
+
+A **manager / sub-agent** setup. The agentic framework is chosen per task, not
+one-size-fits-all: **ReAct only where control flow is dynamic; a fixed workflow
+elsewhere.** Plumbing (order ingestion, BOM depletion, rollups, the approve/reject
+trigger) is plain code with no LLM and is omitted here — see the prose above.
+
+| Framework | Used by | Why |
+|---|---|---|
+| **ReAct** (reason → act → observe → loop) | Central, Billing | Next action depends on the last observation |
+| **Evaluator–Optimizer** (generate → self-check → refine) | Billing | Must validate a promo against guardrails before surfacing |
+| **Workflow** (fixed steps / single judgment call) | Inventory, Order-mgmt, Outreach | Deterministic-ish tasks; a loop adds no value |
+
+The diagram shows each agent, the **tool calls** it makes (expressed as
+`find / aggregate / insert / update`), the **data sources** those calls touch
+(via the MongoDB MCP server's per-agent `tool_filter`), and the **decision points**
+for both the agents and the human. Full per-agent reads/writes are in the
+[Per-agent read/write summary](#per-agent-readwrite-summary) at the bottom.
+
+```mermaid
+flowchart TB
+  classDef agent fill:#a5d8ff,stroke:#1971c2,color:#000;
+  classDef central fill:#d0bfff,stroke:#6741d9,color:#000;
+  classDef decision fill:#ffec99,stroke:#e8590c,color:#000;
+  classDef data fill:#d3f9d8,stroke:#2b8a3e,color:#000;
+  classDef mcp fill:#b2f2bb,stroke:#2f9e44,color:#000;
+  classDef term fill:#f1f3f5,stroke:#868e96,color:#000;
+
+  %% ---- orchestration + decisions ----
+  TRIG{"CENTRAL: worth<br/>evaluating a promo now?"}:::decision
+  CENTRAL["🧠 CENTRAL ORCHESTRATOR — Manager + ReAct<br/>tools: call sub-agents · update(recommendation.status) · log<br/>touches: agent_events, promotion_recommendations"]:::central
+  QGATE{"CENTRAL: justification<br/>real &amp; complete? (source_table)"}:::decision
+  APPROVE{"👤 HUMAN:<br/>approve promo?"}:::decision
+  IDLE([idle / wait]):::term
+  REJECT([rejected → expire]):::term
+
+  %% ---- sub-agents: tool calls -> data sources ----
+  ORD["📈 ORDER-MGMT — single-call<br/>aggregate(orders) · find(menu_items)<br/>update(live_metrics)"]:::agent
+  INV["📦 INVENTORY — workflow +1 judgment<br/>find/aggregate(raw_ingredients, recipes, vendors, orders)<br/>insert(purchase_orders) · update(live_metrics)"]:::agent
+  REORDER{"INVENTORY:<br/>stock &lt; reorder_point?"}:::decision
+  BIL["💳 BILLING — ReAct + Evaluator–Optimizer<br/>find/aggregate(orders, menu_items, recipes,<br/>raw_ingredients, pricing_rules, customers)<br/>insert(promotion_recommendations, promotions, financials)<br/>update(live_metrics)"]:::agent
+  FEAS{"BILLING: within guardrails?<br/>margin≥min · discount≤max · not blackout"}:::decision
+  OUT["📣 OUTREACH — workflow / criteria-based targeting<br/>find(customers by target_criteria, promotions, recommendations)<br/>insert/update(campaign_sends)"]:::agent
+
+  %% ---- data access layer ----
+  MCP[["🍃 MongoDB MCP server<br/>find · aggregate · insert-many · update-many<br/>(per-agent tool_filter)"]]:::mcp
+  DIM[("DIMENSIONS<br/>menu_items · recipes · raw_ingredients<br/>customers · vendors · pricing_rules")]:::data
+  FACT[("FACTS / EVENTS<br/>orders · purchase_orders<br/>campaign_sends · agent_events")]:::data
+  DEC[("DECISIONS<br/>promotion_recommendations · promotions")]:::data
+  SERV[("SERVING<br/>live_metrics · financials")]:::data
+
+  %% ---- control flow + decisions ----
+  TRIG -- no --> IDLE
+  TRIG -- yes --> CENTRAL
+  CENTRAL -- delegate --> ORD
+  CENTRAL -- delegate --> INV
+  CENTRAL -- delegate --> BIL
+  ORD -- context --> CENTRAL
+  INV --> REORDER
+  REORDER -- yes --> INV
+  REORDER -- no --> CENTRAL
+  BIL --> FEAS
+  FEAS -- "no (refine ⟳)" --> BIL
+  FEAS -- yes --> CENTRAL
+  CENTRAL --> QGATE
+  QGATE -- no --> BIL
+  QGATE -- yes --> APPROVE
+  APPROVE -- no --> REJECT
+  APPROVE -- "yes → flip status" --> OUT
+
+  %% ---- tool calls reach data sources via MCP ----
+  ORD -. tool calls .-> MCP
+  INV -. tool calls .-> MCP
+  BIL -. tool calls .-> MCP
+  OUT -. tool calls .-> MCP
+  CENTRAL -. tool calls .-> MCP
+  MCP --> DIM
+  MCP --> FACT
+  MCP --> DEC
+  MCP --> SERV
+```
+
+---
+
 # Dimensions (master data — read-only during service)
 
 ## `menu_items`
