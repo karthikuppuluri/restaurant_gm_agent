@@ -11,7 +11,7 @@ client = genai.Client(
     location=os.environ['GOOGLE_CLOUD_LOCATION'],
 )
 response = client.models.generate_content(
-    model="gemini-3.5-flash",
+    model="gemini-2.5-flash",
     contents="What is the capital of France?",
 )
 print(response.text)
