@@ -8,9 +8,9 @@
 #   read:  agent_events, promotion_recommendations
 #   write: promotion_recommendations (status only), agent_events
 #
-# NOTE: sub_agents below use ADK transfer semantics. For strict manager
-# "sub-agent-as-a-tool" calls (delegate -> get result back without ceding control),
-# wrap each sub-agent in an AgentTool instead and list them under `tools`.
+# Sub-agents are exposed as AgentTools (manager pattern): Central CALLS a specialist,
+# gets its result back, and KEEPS control to synthesize and decide. This differs from
+# `sub_agents:`, which would transfer the conversation to the specialist instead.
 agent_class: LlmAgent
 name: central_orchestrator
 model: gemini-flash-latest
@@ -49,10 +49,19 @@ instruction: |
     all other business writes happen through the sub-agents.
   - Never auto-execute a promo.
   - Money is always integer cents in a Money object — never floats.
-sub_agents:
-  - config_path: inventory_agent.yaml
-  - config_path: order_mgmt_agent.yaml
-  - config_path: billing_agent.yaml
-  - config_path: outreach_agent.yaml
 tools:
+  # Central's own MCP access: read agent_events, set recommendation.status, write log.
   - name: restaurant_gm.tools.central_toolset
+  # The four specialists, each callable as a tool (result returns to Central).
+  - name: AgentTool
+    args:
+      agent: ./inventory_agent.yaml
+  - name: AgentTool
+    args:
+      agent: ./order_mgmt_agent.yaml
+  - name: AgentTool
+    args:
+      agent: ./billing_agent.yaml
+  - name: AgentTool
+    args:
+      agent: ./outreach_agent.yaml

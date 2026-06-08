@@ -139,6 +139,85 @@ flowchart TB
 
 ---
 
+# Serving & frontend
+
+The frontend is **one page (a React SPA) with two panels** — an always-on live
+dashboard and a chat to Central — plus an approve/reject action. They're not two pages;
+they're two connections from the same page that meet only at the approval gate.
+
+- **Dashboard (live, read-only):** does NOT go through the agents or MCP. It reads the
+  serving layer (`live_metrics`, `financials`, `promotion_recommendations`) and stays
+  live via **Change Streams**. Cheap, and keeps updating even when no agent is running.
+- **Chat (request/response):** Central is the ADK root agent, so it is the user-facing
+  NL entry point. ADK serves it over an API (`adk api_server` / Cloud Run, with SSE
+  streaming + sessions); a chat component posts messages and streams tokens back.
+- **Approval gate (where the two meet):** the human clicks approve/reject on a dashboard
+  card; that hits a **thin status-flip endpoint** (plumbing, plain driver) which flips
+  `promotion_recommendations.status` → a Change Stream fires → Central re-enters its loop.
+  Approve/reject never has to go through chat.
+
+Central is invoked from **two sources**, only one of which is the chat API:
+1. a **user chat message** (via `adk api_server`), and
+2. **autonomous promo evaluation** — a **background worker** that watches Change Streams
+   and calls the ADK Runner when an opportunity arises (the same Central agent, run
+   programmatically). For a demo this can be faked via chat and added later.
+
+```mermaid
+flowchart LR
+  classDef ui fill:#ffe8cc,stroke:#e8590c,color:#000;
+  classDef svc fill:#d0bfff,stroke:#6741d9,color:#000;
+  classDef data fill:#d3f9d8,stroke:#2b8a3e,color:#000;
+  classDef plumb fill:#dee2e6,stroke:#343a40,color:#000;
+
+  subgraph FE [" Frontend "]
+    DASH["📊 Live dashboard<br/>(read-only)"]:::ui
+    CHAT["💬 Chat to Central"]:::ui
+    APPROVE["✅ / ⛔ Approve / reject"]:::ui
+  end
+
+  API["Backend / API<br/>+ adk api_server (Runner, SSE)"]:::svc
+  CENTRAL["🧠 central_orchestrator<br/>AgentTools + MCP"]:::svc
+  WORKER["⚙️ Change-stream worker<br/>autonomous trigger (driver)"]:::plumb
+  TRIG["⚙️ status-flip endpoint<br/>plumbing (driver)"]:::plumb
+  SERV[("SERVING LAYER<br/>live_metrics · financials<br/>promotion_recommendations")]:::data
+
+  CHAT -- "message (SSE)" --> API
+  API -- "run" --> CENTRAL
+  DASH -- "subscribe" --> API
+  API -. "Change Streams" .-> SERV
+  SERV -. "live updates" .-> DASH
+  APPROVE --> TRIG --> SERV
+  SERV -. "status change" .-> WORKER
+  WORKER -- "run" --> CENTRAL
+  CENTRAL -- "writes via MCP" --> SERV
+```
+
+## Concrete stack: FastAPI + React
+
+ADK's serving layer **is FastAPI** — `get_fast_api_app()` returns a real FastAPI app
+already exposing session + streaming (`/run_sse`) endpoints backed by a `Runner` (the
+ADK engine that runs the agent and streams `Event`s). So there is **one backend**: that
+app, with our own routes mounted alongside it.
+
+- **FastAPI backend** (single origin):
+  - chat → ADK's `/run_sse` (provided by `get_fast_api_app`),
+  - dashboard feed → our SSE/WebSocket route tailing a MongoDB **Change Stream** (`motor`)
+    on `live_metrics` / `promotion_recommendations`,
+  - approve/reject → our route doing the status flip (`motor` write).
+- **React SPA** (one page) talks to that single origin:
+  - dashboard panel → `EventSource` on the feed route,
+  - chat panel → streaming `fetch` / `EventSource` on `/run_sse`,
+  - approve button → `POST` to the status-flip route.
+- **Autonomous trigger** → either a Change-Stream worker calling the `Runner` directly,
+  or ADK's built-in trigger endpoints (`get_fast_api_app(..., trigger_sources=[...])`,
+  e.g. Cloud Scheduler → Pub/Sub → `/trigger`).
+
+The agent YAMLs in [`restaurant_gm/`](restaurant_gm/) are the reasoning core; this
+FastAPI backend, the Change-Stream listener + status-flip endpoint, the React SPA, and
+the autonomous trigger worker are the serving/IO shell around them (not yet built).
+
+---
+
 # Dimensions (master data — read-only during service)
 
 ## `menu_items`
