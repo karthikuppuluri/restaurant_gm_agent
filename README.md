@@ -3,6 +3,9 @@
 ## TODO
 - [ ] Establish MIT License (hackathon requirement)
 - [ ] Order start times should follow a statistical distribution (e.g. lunch/dinner peaks) rather than uniform random
+- [ ] Demo sim plan: run ~7 sim-days at high SIM_SPEED (500-1000x) to show the full lifecycle in one shot — orders deplete stock → Inventory agent reorders → simulator auto-receives POs (lead_time_days from vendors schema) → Billing spots a pattern and recommends a promo → human approves → Outreach pushes → redemptions land on the dashboard
+- [ ] `plumbing/reconcile.py` — redemption reconciliation: on every order insert that has a promo_id on a line item, mark the matching `campaign_sends` doc as redeemed and increment `promotions.redemption_count`
+- [ ] `plumbing/triggers.py` — human approval gate: watches `promotion_recommendations` for status changes; on approve, re-enters the Central agent loop to configure the promo and kick off Outreach; on reject, logs and goes idle
 
 ---
 
@@ -35,8 +38,16 @@ layer updates -> the dashboard refreshes.
 **Plumbing vs. reasoning.** Three things are deterministic functions, NOT LLM
 steps: (1) order ingestion + **BOM-based stock depletion** (when an order lands,
 a function reads the static recipe and decrements `raw_ingredients`), (2)
-base metric rollups (revenue, covers), and (3) redemption reconciliation
+base metric rollups (revenue, covers, and committed vendor spend from
+`purchase_orders`), and (3) redemption reconciliation
 (`campaign_sends.redeemed` joined back to `orders`). Agents reason over the *results*: Inventory
+
+| Script | Trigger | Does |
+|---|---|---|
+| `plumbing/depletion.py` | order insert (change stream) | decrements `raw_ingredients.on_hand_qty` via BOM |
+| `plumbing/replenishment.py` | PO status → `received` (change stream) | increments `raw_ingredients.on_hand_qty` per PO line items |
+| `plumbing/rollups.py` | order insert (change stream) | recomputes `live_metrics` base fields: revenue, covers, vendor spend |
+| `plumbing/simulator.py` tick | `expected_delivery <= sim_now` | flips overdue `placed` POs to `received`, triggering replenishment |
 decides reorders and derives the 86 list, Order-mgmt analyzes the sales stream,
 Billing computes margin/feasibility and builds + predicts promo recommendations,
 Outreach targets opted-in customers and records sends (redemption reconciliation is
@@ -547,6 +558,7 @@ covers) updated by plumbing; insight fields written by the agents.
 | `as_of` | timestamp | plumbing |
 | `shift_revenue_money` | Money | plumbing |
 | `covers` | int | plumbing |
+| `total_vendor_spend_money` | Money | plumbing — sum of `purchase_orders` with status `placed` or `received` (committed spend only) |
 | `gross_margin_pct` | number | Billing |
 | `sales_pace_vs_baseline_pct` | number | Order-mgmt |
 | `top_movers` | obj[] | Order-mgmt — `{ item_id, qty, velocity }` |

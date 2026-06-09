@@ -206,6 +206,22 @@ def _build_order(
     }
 
 
+# ── PO receipt ────────────────────────────────────────────────────────────────
+
+def _receive_overdue_pos(db, sim_now: datetime) -> int:
+    """Flip placed POs whose expected_delivery has passed to received.
+
+    The Inventory agent writes expected_delivery as an ISO 8601 string
+    (e.g. "2026-06-10T00:00:00Z"). ISO strings sort lexicographically, so a
+    string comparison against _ts(sim_now) is correct and avoids datetime parsing.
+    """
+    result = db.purchase_orders.update_many(
+        {"status": "placed", "expected_delivery": {"$lte": _ts(sim_now)}},
+        {"$set": {"status": "received", "received_at": _ts(sim_now), "updated_at": _ts(sim_now)}},
+    )
+    return result.modified_count
+
+
 # ── main loop ─────────────────────────────────────────────────────────────────
 
 def _next_sim_day(db) -> datetime:
@@ -234,8 +250,20 @@ def _connect():
     return client, client[db_name]
 
 
+def _rebuild_derived() -> None:
+    """Restore all derived state after orders are deleted.
+    Order matters: depletion resets stock to baseline first, then replenishment
+    layers received POs on top, then rollups recomputes metrics."""
+    from plumbing.depletion import rebuild as depletion_rebuild
+    from plumbing.replenishment import rebuild as replenishment_rebuild
+    from plumbing.rollups import rebuild as rollups_rebuild
+    depletion_rebuild()
+    replenishment_rebuild()
+    rollups_rebuild()
+
+
 def reset() -> None:
-    """Delete every order the simulator created; leave seed history untouched."""
+    """Delete every order the simulator created and restore derived state."""
     client, db = _connect()
     try:
         res = db.orders.delete_many({"source": "simulator"})
@@ -245,10 +273,11 @@ def reset() -> None:
               f"Latest order now {latest_day} — next run resumes from there.")
     finally:
         client.close()
+    _rebuild_derived()
 
 
 def undo_last_day() -> None:
-    """Delete only the most recent simulated day; earlier days stay intact."""
+    """Delete only the most recent simulated day and restore derived state."""
     client, db = _connect()
     try:
         latest = db.orders.find_one(
@@ -271,6 +300,7 @@ def undo_last_day() -> None:
               f"Latest order now {new_day} — next run resumes from there.")
     finally:
         client.close()
+    _rebuild_derived()
 
 
 def _is_paused(db) -> bool:
@@ -343,6 +373,11 @@ def run() -> None:
         while sim_now < day_end:
             tick_start = time.monotonic()
             sim_now += timedelta(seconds=SIM_STEP)
+
+            # Auto-receive any POs whose expected_delivery has passed.
+            received = _receive_overdue_pos(db, sim_now)
+            if received:
+                print(f"  [PO] {received} purchase order(s) marked received at {_ts(sim_now)}")
 
             # Poisson arrivals: expected orders in this SIM_STEP-second sim window
             rate = HOURLY_RATE.get(sim_now.hour, 0)
