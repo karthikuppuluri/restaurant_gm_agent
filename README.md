@@ -40,7 +40,11 @@ steps: (1) order ingestion + **BOM-based stock depletion** (when an order lands,
 a function reads the static recipe and decrements `raw_ingredients`), (2)
 base metric rollups (revenue, covers, and committed vendor spend from
 `purchase_orders`), and (3) redemption reconciliation
-(`campaign_sends.redeemed` joined back to `orders`). Agents reason over the *results*: Inventory
+(`campaign_sends.redeemed` joined back to `orders`). Agents reason over the *results*:
+Inventory decides reorders and derives the 86 list, Order-mgmt analyzes the sales
+stream, Billing computes margin/feasibility and builds + predicts promo recommendations,
+Outreach targets opted-in customers and records sends (redemption reconciliation is
+plumbing).
 
 | Script | Trigger | Does |
 |---|---|---|
@@ -48,10 +52,6 @@ base metric rollups (revenue, covers, and committed vendor spend from
 | `plumbing/replenishment.py` | PO status → `received` (change stream) | increments `raw_ingredients.on_hand_qty` per PO line items |
 | `plumbing/rollups.py` | order insert (change stream) | recomputes `live_metrics` base fields: revenue, covers, vendor spend |
 | `plumbing/simulator.py` tick | `expected_delivery <= sim_now` | flips overdue `placed` POs to `received`, triggering replenishment |
-decides reorders and derives the 86 list, Order-mgmt analyzes the sales stream,
-Billing computes margin/feasibility and builds + predicts promo recommendations,
-Outreach targets opted-in customers and records sends (redemption reconciliation is
-plumbing).
 
 **86 status is derived, never stored on `menu_items`.** An item is unavailable
 when the ingredients its recipe needs fall below threshold; the Inventory agent
