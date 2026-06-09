@@ -5,7 +5,8 @@ Run:
     python seed_data.py
 
 Requires MONGODB_CONNECTION_STRING in .env (copy from .env.example).
-Drops and repopulates: raw_ingredients, recipes, menu_items.
+Drops and repopulates: raw_ingredients, vendors, recipes, menu_items,
+pricing_rules, customers (150), orders (~600 over 14 days).
 Insert order is dependency-safe: raw_ingredients → recipes → menu_items.
 """
 
@@ -1018,7 +1019,7 @@ _LOCATIONS = [
 
 _GENDERS     = ["M", "F", "other", "prefer_not_to_say"]
 _GENDER_W    = [45, 45, 5, 5]
-_TIER_POOL   = ["none"] * 25 + ["silver"] * 17 + ["gold"] * 8
+_TIER_POOL   = ["none"] * 75 + ["silver"] * 51 + ["gold"] * 24
 _DIET_OPTIONS = ["vegetarian", "gluten_free", "vegan", "halal", "none"]
 _ITEM_IDS    = [m["item_id"] for m in MENU_ITEMS]
 
@@ -1029,7 +1030,7 @@ def _generate_customers():
     tier_pool = _TIER_POOL[:]
     random.shuffle(tier_pool)
 
-    for i in range(50):
+    for i in range(150):
         hex_id = format(random.randint(0, 0xFFFFFF), "06x")
         cust_id = f"cust_{hex_id}"
         first = _FIRST[i % len(_FIRST)]
@@ -1069,10 +1070,13 @@ CUSTOMERS = _generate_customers()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ORDERS  (75 historical orders, 30 days, no promos)
-# Spread across 2026-05-08 → 2026-06-06. Totals computed from line items.
+# ORDERS  (~600 historical orders, 14 days, no promos)
+# Spread across 2026-05-26 → 2026-06-08. Arrival times follow a lunch/dinner
+# distribution (same shape as the simulator) so the order-mgmt agent has
+# a meaningful baseline to compare against. ~40 orders/weekday, ~50/weekend.
+# Totals use integer BPS arithmetic to stay in sync with pricing_rules.
 # ──────────────────────────────────────────────────────────────────────────────
-_TAX_RATE = 0.0875  # mirrors pricing_rules.tax_rate_bps = 875
+_TAX_BPS = 875  # mirrors pricing_rules.tax_rate_bps
 
 _ITEM_WEIGHTS = {
     "cat_item_crunchy_taco_01":      15,
@@ -1102,40 +1106,40 @@ _ITEM_CUM_WEIGHTS = list(_ITEM_WEIGHTS.values())
 _PRICE_MAP = {m["item_id"]: m["price_money"]["amount"] for m in MENU_ITEMS}
 _NAME_MAP  = {m["item_id"]: m["name"]                  for m in MENU_ITEMS}
 
+# Hour-of-day weights for realistic arrival distribution (lunch + dinner peaks).
+# Matches the simulator's HOURLY_RATE shape so the baseline is comparable.
+_HOUR_POOL    = list(range(10, 23))
+_HOUR_WEIGHTS = [1, 4, 8, 6, 2, 1, 2, 5, 9, 12, 8, 4, 1]  # hours 10-22
+
 
 def _generate_orders():
     random.seed(SEED + 2)
     cust_ids = [c["customer_id"] for c in CUSTOMERS]
-    base = datetime(2026, 5, 8, tzinfo=timezone.utc)
+    base = datetime(2026, 5, 26, tzinfo=timezone.utc)
     orders = []
     order_counter = 1
 
-    for day_offset in range(30):
+    for day_offset in range(14):
         day = base + timedelta(days=day_offset)
-        # 2-3 orders on weekdays, 3-4 on weekends
         is_weekend = day.weekday() >= 5
-        n_orders = random.randint(3, 4) if is_weekend else random.randint(2, 3)
+        n_orders = random.randint(45, 55) if is_weekend else random.randint(37, 45)
 
         for _ in range(n_orders):
-            # pick a service hour: lunch 11-13 or dinner 17-21
-            hour = random.choice([
-                random.randint(11, 13),
-                random.randint(17, 21),
-            ])
+            hour   = random.choices(_HOUR_POOL, weights=_HOUR_WEIGHTS)[0]
             minute = random.randint(0, 59)
-            opened = day.replace(hour=hour, minute=minute, second=0)
+            second = random.randint(0, 59)
+            opened = day.replace(hour=hour, minute=minute, second=second)
 
             channel = random.choices(["DINE_IN", "TAKEOUT"], weights=[60, 40])[0]
             guest_count = random.randint(1, 6) if channel == "DINE_IN" else 1
-            customer_id = random.choice(cust_ids) if random.random() < 0.7 else None
+            customer_id = random.choice(cust_ids) if random.random() < 0.60 else None
 
-            # 2-4 distinct line items
-            n_items = random.randint(2, 4)
+            n_items = random.randint(1, 4)
             chosen_items = random.choices(_ITEM_POOL, weights=_ITEM_CUM_WEIGHTS, k=n_items)
             line_items = []
             total_gross = 0
             for j, item_id in enumerate(chosen_items):
-                qty = random.randint(1, 3)
+                qty = random.randint(1, 6)
                 price = _PRICE_MAP[item_id]
                 gross = price * qty
                 total_gross += gross
@@ -1150,7 +1154,7 @@ def _generate_orders():
                     "promo_id": None,
                 })
 
-            tax = round(total_gross * _TAX_RATE)
+            tax = total_gross * _TAX_BPS // 10000
             net = total_gross + tax
 
             duration = random.randint(10, 20) if channel == "TAKEOUT" else random.randint(20, 55)

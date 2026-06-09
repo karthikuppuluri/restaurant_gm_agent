@@ -414,19 +414,25 @@ The Inventory agent's reorders to vendors. Written by Inventory.
 | `created_by` | string | `agent:inventory` |
 
 ## `campaign_sends`
-Every outreach push, and whether it was redeemed. **Inserted by Outreach** (the push);
-`redeemed` / `redeemed_order_id` are **reconciled by plumbing** (high-frequency,
-event-driven — invariant #3). This is how *actual* uptake is measured (join
-`redeemed_order_id` back to `orders`).
+**Notification log only** — one doc per customer Outreach proactively pushed
+(SMS/email/push). **Inserted by Outreach** (the push); `redeemed` /
+`redeemed_order_id` are **reconciled by plumbing** (high-frequency, event-driven
+— invariant #3). This is NOT the eligibility record for a promo; it tracks
+whether a notified customer later redeemed. Eligibility is determined entirely by
+`promotions.target_criteria` (see design note below).
+
+Actual uptake is measured by joining `redeemed_order_id` back to `orders`.
+Walk-in customers (`customer_id: null`) are never in this collection; they can
+still redeem a promo if they happen to match `target_criteria` on their order.
 
 | Field | Type | Notes |
 |---|---|---|
 | `send_id` | string | PK |
 | `promo_id` | FK->promotions | |
-| `customer_id` | FK->customers | |
+| `customer_id` | FK->customers | Non-null: only tracked/known customers are pushed |
 | `channel` | enum | `sms` \| `push` \| `email` |
 | `status` | enum | `queued` \| `sent` \| `delivered` \| `failed` |
-| `redeemed` | bool | |
+| `redeemed` | bool | Did this notified customer use the promo? |
 | `redeemed_order_id` | FK->orders | Nullable |
 | `sent_at` | timestamp | |
 
@@ -499,6 +505,21 @@ Central on the human's yes/no.
 Created when a recommendation is approved. Written/configured by Billing; read
 by Outreach to push. `redemption_count` reconciled from `campaign_sends`/`orders` by plumbing.
 
+> **Design note — eligibility vs notification (updated 2026-06-09):**
+> `target_criteria` is the **eligibility rule** for redemption, not just the
+> outreach targeting list. Any customer whose profile matches all criteria in
+> `target_criteria` can redeem the promo — whether or not they received a
+> campaign push. Outreach uses the same criteria to decide who to notify
+> proactively, which increases the probability those customers come in; but
+> notification is not a prerequisite for redemption.
+>
+> Consequence for the order simulator and reconciliation plumbing: check
+> `target_criteria` against the customer's profile to determine eligibility.
+> `campaign_sends` is a separate signal — "did we push this customer?" — which
+> raises their redemption probability but is not the gate. Walk-in customers
+> (`customer_id: null`) have no profile to match against and therefore cannot
+> redeem targeted promos.
+
 | Field | Type | Notes |
 |---|---|---|
 | `promo_id` | string | PK |
@@ -506,11 +527,11 @@ by Outreach to push. `redemption_count` reconciled from `campaign_sends`/`orders
 | `title` / `description` | string | |
 | `discount_type` / `discount_value` | enum/int | |
 | `applies_to_item_ids` | FK[]->menu_items | |
-| `target_criteria` | obj | Agent-determined targeting (loyalty_tier, city, age range, dietary_flags, etc.) |
+| `target_criteria` | obj | **Eligibility rule** — any customer matching this can redeem (loyalty_tier, city, age range, dietary_flags, max_price_sensitivity, etc.) |
 | `status` | enum | `live` \| `scheduled` \| `expired` |
 | `valid_from` / `valid_until` | timestamp | |
 | `predicted_uptake` | float | Carried from the recommendation |
-| `redemption_count` | int | Actual, reconciled by plumbing |
+| `redemption_count` | int | Actual, reconciled by plumbing — includes both pushed and organic redeemers |
 | `approved_by` | string | |
 
 ---
