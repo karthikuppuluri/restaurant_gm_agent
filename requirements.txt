@@ -1,3 +1,4 @@
 google-adk
+mcp
 pymongo[srv]
 python-dotenv

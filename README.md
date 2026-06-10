@@ -1,11 +1,13 @@
 # Restaurant GM — Data Model
 
 ## TODO
+- [ ] Add `max_tool_calls` (or equivalent ADK budget) to each agent YAML to hard-cap round-trips — order_mgmt=4, inventory=~6, billing=~8, outreach=~4, central=~6
 - [ ] Establish MIT License (hackathon requirement)
 - [ ] Order start times should follow a statistical distribution (e.g. lunch/dinner peaks) rather than uniform random
 - [ ] Demo sim plan: run ~7 sim-days at high SIM_SPEED (500-1000x) to show the full lifecycle in one shot — orders deplete stock → Inventory agent reorders → simulator auto-receives POs (lead_time_days from vendors schema) → Billing spots a pattern and recommends a promo → human approves → Outreach pushes → redemptions land on the dashboard
 - [ ] `plumbing/reconcile.py` — redemption reconciliation: on every order insert that has a promo_id on a line item, mark the matching `campaign_sends` doc as redeemed and increment `promotions.redemption_count`
 - [ ] `plumbing/triggers.py` — human approval gate: watches `promotion_recommendations` for status changes; on approve, re-enters the Central agent loop to configure the promo and kick off Outreach; on reject, logs and goes idle
+- [ ] Low-stock human prompt: when `live_metrics.low_stock` is updated with new items, surface an alert to the GM ("cheese is below reorder point — reorder?"); if GM says yes, Central transfers to inventory_agent to place the PO. Keeps human in the loop for purchasing decisions.
 
 ---
 

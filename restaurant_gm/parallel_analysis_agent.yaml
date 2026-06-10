@@ -1,0 +1,14 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/google/adk-python/refs/heads/main/src/google/adk/agents/config_schemas/AgentConfig.json
+#
+# Runs order_mgmt_agent and inventory_agent simultaneously.
+# Both write their results to live_metrics independently — no dependency between them.
+# Central calls this as a single AgentTool and reads live_metrics after it completes.
+agent_class: ParallelAgent
+name: parallel_analysis
+description: >
+  Runs order_mgmt_agent (sales pace, top movers) and inventory_agent (stock levels,
+  86 list, POs) in parallel. Both write to live_metrics. Central reads live_metrics
+  after this completes to get the combined picture.
+sub_agents:
+  - config_path: ./order_mgmt_agent.yaml
+  - config_path: ./inventory_agent.yaml

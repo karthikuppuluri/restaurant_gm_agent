@@ -267,6 +267,12 @@ def reset() -> None:
     client, db = _connect()
     try:
         res = db.orders.delete_many({"source": "simulator"})
+        # Clear live_metrics so agents don't see a stale as_of after reset
+        db.live_metrics.update_one(
+            {"_id": "current"},
+            {"$unset": {"as_of": "", "sales_pace_vs_baseline_pct": "",
+                        "top_movers": "", "low_stock": "", "eighty_sixed_item_ids": ""}},
+        )
         latest = db.orders.find_one(sort=[("opened_at", -1)], projection={"opened_at": 1})
         latest_day = latest["opened_at"][:10] if latest else "(none)"
         print(f"Deleted {res.deleted_count} simulator orders. "

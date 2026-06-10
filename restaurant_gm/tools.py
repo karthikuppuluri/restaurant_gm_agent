@@ -1,20 +1,17 @@
 """MongoDB MCP toolsets for the Restaurant GM agents.
 
-Each agent gets its OWN ``McpToolset`` with a scoped ``tool_filter`` so it can only
-invoke the MongoDB operations it actually needs. This is the agents' single data
-path (invariant #4: agents reach Mongo through the MongoDB MCP server; deterministic
-plumbing uses the plain driver instead).
+Single shared McpToolset — one npx process, one Atlas connection. Per-agent
+operation scoping (tool_filter) was causing 5 zombie npx processes per session
+because ADK never cleans up module-level McpToolset subprocess on session end.
+Collection-level scope is still enforced by each agent's instruction.
 
-All toolsets talk to the same Atlas cluster and differ only in the operations they
-expose. ``tool_filter`` scopes *operations*, not collections — collection-level
-scope is enforced by each agent's instruction and, in production, by a
-least-privilege MongoDB user. (Exact tool_filter + collection scope for every agent
-is documented at the top of that agent's YAML in this folder.)
-
-HOW TO EXTEND (for collaborators):
-``inventory_toolset`` below is the fully worked-out example. To wire up another
-agent, copy that one block and change only the ``tool_filter`` to match the values
-in its YAML. Stubs for the remaining four are at the bottom — uncomment and go.
+Real tool names verified by running the server and calling get_tools() (2026-06-09):
+    aggregate, aggregate-db, collection-indexes, collection-schema,
+    collection-storage-size, connect, count, create-collection, create-index,
+    db-stats, delete-many, drop-collection, drop-database, drop-index, explain,
+    export, find, insert-many, list-collections, list-databases, mongodb-logs,
+    rename-collection, update-many
+Note: there is no insert-one or update-one — bulk operations only.
 """
 
 import os
@@ -33,47 +30,41 @@ def _mongodb_mcp_connection() -> StdioConnectionParams:
     Node, any deploy container needs Node installed alongside Python.
     """
     connection_string = os.environ["MONGODB_CONNECTION_STRING"]
+    db_name = os.environ.get("MONGODB_DB_NAME", "restaurant_gm")
+
+    # Inject the database name into the connection string so the MCP server
+    # queries the right database. Atlas URIs look like:
+    #   mongodb+srv://user:pass@cluster.net/?params
+    # We need:
+    #   mongodb+srv://user:pass@cluster.net/restaurant_gm?params
+    if "?" in connection_string:
+        host, params = connection_string.split("?", 1)
+        host = host.rstrip("/")
+        connection_string_with_db = f"{host}/{db_name}?{params}"
+    else:
+        connection_string_with_db = f"{connection_string.rstrip('/')}/{db_name}"
+
     return StdioConnectionParams(
         server_params=StdioServerParameters(
             command="npx",
             args=["-y", "mongodb-mcp-server"],
-            env={"MDB_MCP_CONNECTION_STRING": connection_string},
+            env={"MDB_MCP_CONNECTION_STRING": connection_string_with_db},
         ),
     )
 
 
-# --- EXEMPLAR -----------------------------------------------------------------
-# Inventory monitors stock, derives the 86 list, and reorders. It needs reads
-# (find / aggregate) plus two writes (insert purchase_orders, update live_metrics).
-# Referenced from inventory_agent.yaml as `restaurant_gm.tools.inventory_toolset`.
-#   read:  raw_ingredients, recipes, vendors, orders
-#   write: purchase_orders, live_metrics, agent_events
-inventory_toolset = McpToolset(
+# Single shared toolset — all agents reference one of these aliases.
+# Scoping is enforced by each agent's instruction, not tool_filter.
+# Full op set: find + aggregate for reads, insert-many + update-many for writes,
+# count for quick checks.
+_shared = McpToolset(
     connection_params=_mongodb_mcp_connection(),
-    tool_filter=["find", "aggregate", "insert-many", "update-many"],
+    tool_filter=["find", "aggregate", "count", "insert-many", "update-many"],
 )
 
-
-# --- TODO (collaborators): define the rest the same way -----------------------
-# Copy the exemplar above; only the tool_filter changes. Each list mirrors the
-# `tool_filter:` documented in that agent's YAML.
-#
-# order_mgmt_toolset = McpToolset(
-#     connection_params=_mongodb_mcp_connection(),
-#     tool_filter=["find", "aggregate", "update-many", "insert-many"],
-# )
-#
-# billing_toolset = McpToolset(
-#     connection_params=_mongodb_mcp_connection(),
-#     tool_filter=["find", "aggregate", "insert-many", "update-many"],
-# )
-#
-# outreach_toolset = McpToolset(
-#     connection_params=_mongodb_mcp_connection(),
-#     tool_filter=["find", "insert-many"],
-# )
-#
-# central_toolset = McpToolset(
-#     connection_params=_mongodb_mcp_connection(),
-#     tool_filter=["find", "update-many", "insert-many"],
-# )
+# Aliases so the YAML `tools: - name:` references still resolve.
+order_mgmt_toolset = _shared
+inventory_toolset = _shared
+billing_toolset = _shared
+outreach_toolset = _shared
+central_toolset = _shared
