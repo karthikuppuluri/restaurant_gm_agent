@@ -9,6 +9,7 @@
 - [ ] `plumbing/reconcile.py` — redemption reconciliation: on every order insert that has a promo_id on a line item, mark the matching `campaign_sends` doc as redeemed and increment `promotions.redemption_count`
 - [ ] `plumbing/triggers.py` — human approval gate: watches `promotion_recommendations` for status changes; on approve, re-enters the Central agent loop to configure the promo and kick off Outreach; on reject, logs and goes idle
 - [ ] Low-stock human prompt: when `live_metrics.low_stock` is updated with new items, surface an alert to the GM ("cheese is below reorder point — reorder?"); if GM says yes, Central transfers to inventory_agent to place the PO. Keeps human in the loop for purchasing decisions.
+- [ ] Reset should also clear `purchase_orders` and `promotion_recommendations` (and dependent `promotions`, `campaign_sends`) so a full reset returns the DB to a clean seed state — currently only simulator orders + derived stock/metrics are wiped
 
 ---
 
