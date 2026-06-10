@@ -2,6 +2,7 @@
 
 ## TODO
 - [ ] Add `max_tool_calls` (or equivalent ADK budget) to each agent YAML to hard-cap round-trips — order_mgmt=4, inventory=~6, billing=~8, outreach=~4, central=~6
+- [ ] Fix Gemini `print(default_api.aggregate(...))` code-generation bug — model occasionally wraps MCP tool calls in Python syntax instead of JSON when pipelines get complex; current mitigation is an instruction-level prohibition but a proper fix may require ADK-level tool call formatting enforcement or switching to a model config that disables code execution mode
 - [ ] Establish MIT License (hackathon requirement)
 - [ ] Order start times should follow a statistical distribution (e.g. lunch/dinner peaks) rather than uniform random
 - [ ] Demo sim plan: run ~7 sim-days at high SIM_SPEED (500-1000x) to show the full lifecycle in one shot — orders deplete stock → Inventory agent reorders → simulator auto-receives POs (lead_time_days from vendors schema) → Billing spots a pattern and recommends a promo → human approves → Outreach pushes → redemptions land on the dashboard
