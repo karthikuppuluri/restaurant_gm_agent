@@ -112,7 +112,8 @@ def _build_order(
     name_map: dict,
     tax_rate_bps: int,
     db,
-) -> dict:
+    bom: dict,
+) -> dict | None:
     # Customer: 60% known, 40% walk-in
     if customers and random.random() < 0.60:
         customer = random.choice(customers)
@@ -124,10 +125,34 @@ def _build_order(
     channel = random.choices(["DINE_IN", "TAKEOUT"], weights=[60, 40])[0]
     guest_count = random.randint(1, 6) if channel == "DINE_IN" else 1
 
-    chosen_items = random.choices(items, weights=item_weights, k=random.randint(1, 4))
+    # Availability gate: a customer cannot order an item whose ingredients are
+    # out (86 is derived from stock — invariant #2 — and the simulator must
+    # respect it, otherwise depletion drives on_hand_qty negative). `stock` is a
+    # local view, decremented per line so one order can't oversell itself either.
+    stock = {r["_id"]: r["on_hand_qty"] for r in db.raw_ingredients.find({}, {"on_hand_qty": 1})}
+
+    def _can_make(item_id: str) -> int:
+        needs = bom.get(item_id)
+        if not needs:
+            return 0
+        return int(min(stock.get(i, 0) / q for i, q in needs.items() if q > 0))
+
+    available = [(it, w) for it, w in zip(items, item_weights)
+                 if _can_make(it["item_id"]) >= 1]
+    if not available:
+        return None  # everything is 86'd — customer turned away
+    avail_items = [x[0] for x in available]
+    avail_weights = [x[1] for x in available]
+
+    chosen_items = random.choices(avail_items, weights=avail_weights, k=random.randint(1, 4))
     line_items = []
     for j, item in enumerate(chosen_items):
-        qty = random.randint(1, 6)
+        cap = _can_make(item["item_id"])
+        if cap < 1:
+            continue  # an earlier line in this order used up the stock
+        qty = min(random.randint(1, 6), cap)
+        for ing_id, need in bom[item["item_id"]].items():
+            stock[ing_id] = stock.get(ing_id, 0) - need * qty
         price = price_map[item["item_id"]]
         gross = price * qty
         line_items.append({
@@ -140,6 +165,8 @@ def _build_order(
             "applied_discount_money": _money(0),
             "promo_id": None,
         })
+    if not line_items:
+        return None
 
     # Promo awareness — dormant until a live promotions doc exists.
     # Eligibility is determined by promotions.target_criteria, not campaign_sends.
@@ -222,6 +249,17 @@ def _receive_overdue_pos(db, sim_now: datetime) -> int:
     return result.modified_count
 
 
+def _expire_promos(db, sim_now: datetime) -> int:
+    """Flip live promotions whose valid_until has passed (in SIM time) to expired.
+    Keeps the dashboard's live/past split honest and re-arms the worker's
+    promo-opportunity suppression (which skips while a promo is live)."""
+    result = db.promotions.update_many(
+        {"status": "live", "valid_until": {"$lte": _ts(sim_now)}},
+        {"$set": {"status": "expired", "updated_at": _ts(sim_now)}},
+    )
+    return result.modified_count
+
+
 # ── main loop ─────────────────────────────────────────────────────────────────
 
 def _next_sim_day(db) -> datetime:
@@ -263,19 +301,30 @@ def _rebuild_derived() -> None:
 
 
 def reset() -> None:
-    """Delete every order the simulator created and restore derived state."""
+    """Full reset to seed state: delete every simulator order AND all agent-written
+    / downstream collections (POs, recommendations, promos, sends, events), then
+    rebuild derived state. Seed orders and dimensions are untouched."""
     client, db = _connect()
     try:
         res = db.orders.delete_many({"source": "simulator"})
-        # Clear live_metrics so agents don't see a stale as_of after reset
+        cleared = []
+        for coll in ("purchase_orders", "promotion_recommendations", "promotions",
+                     "campaign_sends", "agent_events"):
+            n = db[coll].delete_many({}).deleted_count
+            if n:
+                cleared.append(f"{coll}={n}")
+        # Clear live_metrics insight fields so nothing stale survives the reset;
+        # the rebuild below recomputes the base fields.
         db.live_metrics.update_one(
             {"_id": "current"},
             {"$unset": {"as_of": "", "sales_pace_vs_baseline_pct": "",
-                        "top_movers": "", "low_stock": "", "eighty_sixed_item_ids": ""}},
+                        "top_movers": "", "low_stock": "", "eighty_sixed_item_ids": "",
+                        "gross_margin_pct": "", "active_promo_perf": ""}},
         )
         latest = db.orders.find_one(sort=[("opened_at", -1)], projection={"opened_at": 1})
         latest_day = latest["opened_at"][:10] if latest else "(none)"
         print(f"Deleted {res.deleted_count} simulator orders. "
+              f"Cleared: {', '.join(cleared) or 'nothing else'}. "
               f"Latest order now {latest_day} — next run resumes from there.")
     finally:
         client.close()
@@ -360,6 +409,16 @@ def run() -> None:
     price_map = {item["item_id"]: item["price_money"]["amount"] for item in items}
     name_map = {item["item_id"]: item["name"] for item in items}
 
+    # Static per-serving BOM: item_id -> { ingredient_id: qty per serving }.
+    # Used by the availability gate in _build_order (86'd items can't be ordered).
+    recipes = {r["recipe_id"]: r for r in db.recipes.find({}, {"_id": 0})}
+    bom = {}
+    for item in items:
+        rec = recipes.get(item.get("recipe_id"))
+        if rec:
+            y = rec.get("yield_qty", 1) or 1
+            bom[item["item_id"]] = {i["ingredient_id"]: i["qty"] / y for i in rec["ingredients"]}
+
     # A fresh run always starts in the running state, clearing any stale pause.
     _set_paused(db, False)
 
@@ -384,6 +443,11 @@ def run() -> None:
             received = _receive_overdue_pos(db, sim_now)
             if received:
                 print(f"  [PO] {received} purchase order(s) marked received at {_ts(sim_now)}")
+
+            # Expire any live promos whose window has closed (sim time).
+            expired = _expire_promos(db, sim_now)
+            if expired:
+                print(f"  [PROMO] {expired} promotion(s) expired at {_ts(sim_now)}")
 
             # Poisson arrivals: expected orders in this SIM_STEP-second sim window
             rate = HOURLY_RATE.get(sim_now.hour, 0)
@@ -412,8 +476,11 @@ def run() -> None:
                 try:
                     doc = _build_order(
                         order_time, customers, items, item_weights,
-                        price_map, name_map, tax_rate_bps, db,
+                        price_map, name_map, tax_rate_bps, db, bom,
                     )
+                    if doc is None:
+                        print(f"[{_ts(order_time)}] customer turned away — items unavailable (86)")
+                        continue
                     db.orders.insert_one(doc)
                     cust_label = doc["customer_id"] or "walk-in"
                     net_dollars = doc["net_amount_money"]["amount"] / 100

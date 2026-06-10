@@ -224,3 +224,9 @@ __marimo__/
 .claude/
 
 
+
+# Node / frontend
+node_modules/
+
+# ADK local session state
+.adk/

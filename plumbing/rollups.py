@@ -2,10 +2,16 @@
 plumbing/rollups.py — base-metric rollups (deterministic, NO LLM).
 
 Keeps the singleton `live_metrics` document's BASE fields current:
-  - shift_revenue_money       (sum of net_amount over simulator orders)
-  - covers                    (sum of guest_count)
+  - shift_revenue_money       (sum of net_amount over the CURRENT sim-day's simulator orders)
+  - covers                    (guest_count over the same current sim-day)
   - total_vendor_spend_money  (sum of placed/received purchase_orders)
-  - as_of                     (now)
+  - cash_on_hand_money        (STARTING_CASH + all-time net revenue - vendor spend)
+  - as_of                     (SIM time = opened_at of the latest order, NOT wall clock)
+
+Also upserts the current sim-day's `financials` doc on each order insert (the
+daily P&L lives in plumbing/financials.py; this listener just keeps "today"
+current). Note: a PO insert changes vendor spend / cash but is only picked up
+on the next order insert — orders are frequent enough that this is fine.
 
 Live, order-by-order via a change stream on `orders`. Only `source: "simulator"`
 orders count (seed/historical orders are baseline — same rule as depletion).
@@ -33,6 +39,13 @@ from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from pymongo import MongoClient
+
+from plumbing.financials import (
+    STARTING_CASH_CENTS,
+    backfill as financials_backfill,
+    item_maps,
+    rollup_day,
+)
 
 load_dotenv()
 
@@ -62,8 +75,16 @@ def _connect():
 def _recompute(db) -> dict:
     """Re-aggregate base metrics over simulator orders and purchase_orders, then
     $set them on the singleton. Returns the computed values. Idempotent."""
+    now = _now()
+    # as_of is SIM time (latest order) — it also defines the current sim-day.
+    latest = db.orders.find_one({}, {"opened_at": 1}, sort=[("opened_at", -1)])
+    as_of = latest["opened_at"] if latest else now
+
+    # Shift metrics cover ONLY the current sim-day: a new day starts the count
+    # over (a GM's "how is tonight going" number, not an all-time total).
+    day_start = f"{as_of[:10]}T00:00:00Z"
     order_agg = list(db.orders.aggregate([
-        {"$match": {"source": "simulator"}},
+        {"$match": {"source": "simulator", "opened_at": {"$gte": day_start}}},
         {"$group": {
             "_id": None,
             "revenue": {"$sum": "$net_amount_money.amount"},
@@ -80,7 +101,17 @@ def _recompute(db) -> dict:
     ]))
     vendor_spend = po_agg[0]["spend"] if po_agg else 0
 
-    now = _now()
+    # Operating cash: all-time pre-tax net revenue (seed baseline + simulator,
+    # matching financials) minus committed vendor spend, on top of starting cash.
+    all_agg = list(db.orders.aggregate([
+        {"$group": {
+            "_id": None,
+            "gross": {"$sum": "$total_money.amount"},
+            "discount": {"$sum": "$total_discount_money.amount"},
+        }},
+    ]))
+    all_net = (all_agg[0]["gross"] - all_agg[0]["discount"]) if all_agg else 0
+    cash = STARTING_CASH_CENTS + all_net - vendor_spend
     db.live_metrics.update_one(
         {"_id": _LIVE_ID},
         {
@@ -88,7 +119,8 @@ def _recompute(db) -> dict:
                 "shift_revenue_money": _money(revenue),
                 "covers": covers,
                 "total_vendor_spend_money": _money(vendor_spend),
-                "as_of": now,
+                "cash_on_hand_money": _money(cash),
+                "as_of": as_of,
                 "updated_at": now,
             },
             "$setOnInsert": {
@@ -99,17 +131,19 @@ def _recompute(db) -> dict:
         },
         upsert=True,
     )
-    return {"revenue": revenue, "covers": covers, "vendor_spend": vendor_spend}
+    return {"revenue": revenue, "covers": covers, "vendor_spend": vendor_spend,
+            "cash": cash}
 
 
 def rebuild() -> None:
-    """Recompute base fields from facts (reset/undo path)."""
+    """Recompute base fields + all financials docs from facts (reset/undo path)."""
     client, db = _connect()
     try:
         r = _recompute(db)
         print(f"Rebuilt live_metrics base: "
               f"shift_revenue=${r['revenue']/100:.2f}  covers={r['covers']}  "
-              f"vendor_spend=${r['vendor_spend']/100:.2f}")
+              f"vendor_spend=${r['vendor_spend']/100:.2f}  cash=${r['cash']/100:.2f}")
+        financials_backfill(db)
     finally:
         client.close()
 
@@ -117,9 +151,12 @@ def rebuild() -> None:
 def run() -> None:
     client, db = _connect()
     try:
+        # Static BOM cost/category maps for the daily financials upsert.
+        cost_map, cat_map = item_maps(db)
         r = _recompute(db)
         print(f"Synced live_metrics: shift_revenue=${r['revenue']/100:.2f}  "
-              f"covers={r['covers']}  vendor_spend=${r['vendor_spend']/100:.2f}")
+              f"covers={r['covers']}  vendor_spend=${r['vendor_spend']/100:.2f}  "
+              f"cash=${r['cash']/100:.2f}")
         print("Watching orders for new simulator inserts… Ctrl-C to stop.\n")
 
         with db.orders.watch([{"$match": {"operationType": "insert"}}]) as stream:
@@ -128,9 +165,10 @@ def run() -> None:
                 if doc.get("source") != "simulator":
                     continue
                 r = _recompute(db)
+                rollup_day(db, doc["opened_at"][:10], cost_map, cat_map)
                 print(f"  rollup updated after {doc['_id']}  "
                       f"shift_revenue=${r['revenue']/100:.2f}  covers={r['covers']}  "
-                      f"vendor_spend=${r['vendor_spend']/100:.2f}")
+                      f"vendor_spend=${r['vendor_spend']/100:.2f}  cash=${r['cash']/100:.2f}")
     except KeyboardInterrupt:
         print("\nRollups listener stopped.")
     finally:

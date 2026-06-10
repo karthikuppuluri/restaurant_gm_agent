@@ -72,11 +72,43 @@ def _depletion_for_order(order, item_to_recipe, recipes) -> dict:
 
 
 def _apply_depletion(db, totals: dict) -> None:
+    # Pipeline update so the decrement floors at 0 atomically. The simulator's
+    # availability gate prevents ordering 86'd items, but at high SIM_SPEED a few
+    # orders can land before this listener depletes them — the clamp absorbs
+    # that race instead of letting stock go negative.
     for ing_id, amt in totals.items():
         db.raw_ingredients.update_one(
             {"_id": ing_id},
-            {"$inc": {"on_hand_qty": -amt}, "$set": {"updated_at": _now()}},
+            [{"$set": {
+                "on_hand_qty": {"$max": [0, {"$round": [
+                    {"$subtract": ["$on_hand_qty", amt]}, 3]}]},
+                "updated_at": _now(),
+            }}],
         )
+
+
+def publish_availability(db) -> None:
+    """Recompute live_metrics.low_stock + eighty_sixed_item_ids from current stock.
+
+    Pure derivation (stock vs reorder_point; zero-stock ingredients -> affected
+    menu items), no judgment — so plumbing republishes it on every stock change
+    and the dashboard's Stock & supply panel stays current. The Inventory agent
+    publishes the same derivation when it runs; both writers agree by construction.
+    """
+    ings = list(db.raw_ingredients.find(
+        {}, {"ingredient_id": 1, "name": 1, "on_hand_qty": 1, "reorder_point": 1}))
+    low = [{"ingredient_id": i["ingredient_id"], "name": i.get("name"),
+            "on_hand_qty": i["on_hand_qty"], "reorder_point": i["reorder_point"],
+            "status": "low"}
+           for i in ings if i["on_hand_qty"] < i["reorder_point"]]
+    zero = [i["ingredient_id"] for i in ings if i["on_hand_qty"] <= 0]
+    dead = sorted(db.recipes.distinct(
+        "menu_item_id", {"ingredients.ingredient_id": {"$in": zero}})) if zero else []
+    db.live_metrics.update_one(
+        {"_id": "current"},
+        {"$set": {"low_stock": low, "eighty_sixed_item_ids": dead, "updated_at": _now()}},
+        upsert=True,
+    )
 
 
 def _process_order(db, order_id, item_to_recipe, recipes) -> bool:
@@ -92,6 +124,7 @@ def _process_order(db, order_id, item_to_recipe, recipes) -> bool:
     if claimed is None:
         return False
     _apply_depletion(db, _depletion_for_order(claimed, item_to_recipe, recipes))
+    publish_availability(db)
     return True
 
 
@@ -131,6 +164,7 @@ def rebuild() -> None:
             for ing_id, amt in _depletion_for_order(order, item_to_recipe, recipes).items():
                 totals[ing_id] = totals.get(ing_id, 0) + amt
         _apply_depletion(db, totals)
+        publish_availability(db)
 
         n = db.orders.count_documents({"source": "simulator"})
         print(f"Rebuilt stock: reset to baseline, re-depleted from {n} simulator orders.")

@@ -1,15 +1,16 @@
 # Restaurant GM — Data Model
 
 ## TODO
-- [ ] Add `max_tool_calls` (or equivalent ADK budget) to each agent YAML to hard-cap round-trips — order_mgmt=4, inventory=~6, billing=~8, outreach=~4, central=~6
-- [ ] Fix Gemini `print(default_api.aggregate(...))` code-generation bug — model occasionally wraps MCP tool calls in Python syntax instead of JSON when pipelines get complex; current mitigation is an instruction-level prohibition but a proper fix may require ADK-level tool call formatting enforcement or switching to a model config that disables code execution mode
+- [ ] Add `max_tool_calls` (or equivalent ADK budget) to each agent YAML to hard-cap round-trips — order_mgmt=3, inventory=3, billing=4, outreach=2, central=8
+- [x] Fix Gemini `print(default_api.aggregate(...))` code-generation bug — fixed 2026-06-10 by moving all fixed-workflow reads to deterministic helper tools (`restaurant_gm/queries.py`, driver-backed, trivial/no arguments): the model no longer authors complex pipelines, which is exactly where the bug fired. Also set `temperature: 0` on every agent. MCP remains the write path + ad-hoc reads
 - [ ] Establish MIT License (hackathon requirement)
 - [ ] Order start times should follow a statistical distribution (e.g. lunch/dinner peaks) rather than uniform random
 - [ ] Demo sim plan: run ~7 sim-days at high SIM_SPEED (500-1000x) to show the full lifecycle in one shot — orders deplete stock → Inventory agent reorders → simulator auto-receives POs (lead_time_days from vendors schema) → Billing spots a pattern and recommends a promo → human approves → Outreach pushes → redemptions land on the dashboard
 - [ ] `plumbing/reconcile.py` — redemption reconciliation: on every order insert that has a promo_id on a line item, mark the matching `campaign_sends` doc as redeemed and increment `promotions.redemption_count`
-- [ ] `plumbing/triggers.py` — human approval gate: watches `promotion_recommendations` for status changes; on approve, re-enters the Central agent loop to configure the promo and kick off Outreach; on reject, logs and goes idle
-- [ ] Low-stock human prompt: when `live_metrics.low_stock` is updated with new items, surface an alert to the GM ("cheese is below reorder point — reorder?"); if GM says yes, Central transfers to inventory_agent to place the PO. Keeps human in the loop for purchasing decisions.
-- [ ] Reset should also clear `purchase_orders` and `promotion_recommendations` (and dependent `promotions`, `campaign_sends`) so a full reset returns the DB to a clean seed state — currently only simulator orders + derived stock/metrics are wiped
+- [ ] `plumbing/worker.py` — autonomous trigger worker (absorbs the old `triggers.py` idea): a single-flight change-stream watcher that invokes Central via the ADK Runner with a targeted prompt. Detection is deterministic plumbing; the agent is only invoked when there is something to decide. Three triggers, each with suppression rules so one condition can't spam LLM runs: (1) **low stock** — `raw_ingredients.on_hand_qty` falls below `reorder_point` → invoke inventory to reorder (suppressed if an open `draft`/`placed` PO already covers the ingredient, or within cooldown); (2) **promo opportunity** — signal-based check on `live_metrics` (sales pace above baseline, or a top mover with deep stock cover) → invoke Central to evaluate a promo (suppressed while a `pending` recommendation exists or a promo is `live`); (3) **human decision** — `promotion_recommendations.status` flips to `approved` → invoke Central to run Billing Mode B + Outreach
+- [ ] **Decided 2026-06-10: reorders are autonomous, promos are human-gated.** Inventory places POs without approval when funds allow (PO total ≤ `live_metrics.cash_on_hand_money`); the human approval gate applies only to customer-facing promos. Add the funds check to the inventory agent YAML.
+- [x] `financials` is populated by **plumbing, not Billing** (deterministic P&L = invariant #3). Done 2026-06-10: `plumbing/financials.py` backfills one doc per sim-day (revenue, discounts, COGS from the static item→food-cost map via recipes, margin, by_category); `rollups.py` upserts the current sim-day's doc on each order insert; `live_metrics.cash_on_hand_money` = STARTING_CASH ($25k, env-overridable) + Σ all-time pre-tax net revenue − committed vendor spend — this is what the inventory funds check reads
+- [x] Reset clears everything (done 2026-06-10): `simulator --reset` now also deletes `purchase_orders`, `promotion_recommendations`, `promotions`, `campaign_sends`, `agent_events`, unsets all live_metrics insight fields, and rebuilds derived state. For a dimensions-too factory reset, re-run `seed_data.py` then `rollups --rebuild`
 
 ---
 
@@ -54,8 +55,10 @@ plumbing).
 |---|---|---|
 | `plumbing/depletion.py` | order insert (change stream) | decrements `raw_ingredients.on_hand_qty` via BOM |
 | `plumbing/replenishment.py` | PO status → `received` (change stream) | increments `raw_ingredients.on_hand_qty` per PO line items |
-| `plumbing/rollups.py` | order insert (change stream) | recomputes `live_metrics` base fields: revenue, covers, vendor spend |
+| `plumbing/rollups.py` | order insert (change stream) | recomputes `live_metrics` base fields (revenue, covers, vendor spend, cash on hand) + upserts the current sim-day's `financials` doc |
+| `plumbing/financials.py` | manual / reset (`rollups --rebuild` calls it) | backfills one `financials` P&L doc per sim-day from `orders` × the static BOM |
 | `plumbing/simulator.py` tick | `expected_delivery <= sim_now` | flips overdue `placed` POs to `received`, triggering replenishment |
+| `plumbing/simulator.py` order build | per order | availability gate: 86'd items can't be ordered (stock checked against the BOM, qty capped at what stock can make; customer turned away if nothing is available) — paired with a floor-at-0 clamp in `depletion.py` so `on_hand_qty` can never go negative |
 
 **86 status is derived, never stored on `menu_items`.** An item is unavailable
 when the ingredients its recipe needs fall below threshold; the Inventory agent
@@ -76,12 +79,21 @@ trigger) is plain code with no LLM and is omitted here — see the prose above.
 | **Evaluator–Optimizer** (generate → self-check → refine) | Billing | Must validate a promo against guardrails before surfacing |
 | **Workflow** (fixed steps / single judgment call) | Inventory, Order-mgmt, Outreach | Deterministic-ish tasks; a loop adds no value |
 
-Each specialist is an ADK `LlmAgent` that reaches MongoDB **through the MongoDB MCP
-server** — the agent composes `find` / `aggregate` calls and interprets the results,
-but the **arithmetic runs server-side in aggregation pipelines, never in the model**
-(invariant #3). The only deterministic, driver-based (non-MCP) code is the
-high-frequency, per-order **plumbing**: order ingestion + BOM depletion, base-metric
-rollups, and redemption reconciliation. Agent configs live in
+Each specialist is an ADK `LlmAgent` with a split data path:
+
+- **Fixed-workflow reads** go through deterministic **helper tools** in
+  [`restaurant_gm/queries.py`](restaurant_gm/queries.py) (`stock_snapshot`,
+  `sales_snapshot`, `promo_evidence`, `promo_audience`, `get_sim_now`) — driver-backed,
+  one call returns everything the workflow needs, with all arithmetic (sums, margins,
+  PO quantities, date math) precomputed (invariant #3). The model passes trivial or no
+  arguments, which also eliminates the Gemini pipeline-authoring codegen bug.
+- **All agent writes** (purchase orders, recommendations, promotions, campaign sends,
+  live_metrics insight fields) and **ad-hoc analyst reads** go **through the MongoDB
+  MCP server** — the agent composes the call and interprets the results.
+
+The other deterministic, driver-based code is the high-frequency, per-order
+**plumbing**: order ingestion + BOM depletion, base-metric rollups + daily financials,
+and redemption reconciliation. Agent configs live in
 [`restaurant_gm/*.yaml`](restaurant_gm/) (`root_agent.yaml` is Central).
 
 The diagram shows each agent, the **tool calls** it makes (expressed as
@@ -452,8 +464,11 @@ still redeem a promo if they happen to match `target_criteria` on their order.
 | `sent_at` | timestamp | |
 
 ## `agent_events` (the transparency log)
-Append-only. **Every agent writes here.** This is the audit trail behind every
-recommendation's "why."
+Append-only. **Written by `plumbing/worker.py`** after each autonomous agent run:
+the `summary`/`reasoning` fields carry the agent's own final response verbatim
+(zero extra LLM calls). The dashboard's "Agent activity" feed and 🤖 toasts read
+from here. Agents do not write it themselves (removed as overkill for chat-driven
+actions, which are already visible in the chat).
 
 | Field | Type | Notes |
 |---|---|---|
@@ -563,19 +578,22 @@ covers) updated by plumbing; insight fields written by the agents.
 | `shift_revenue_money` | Money | plumbing |
 | `covers` | int | plumbing |
 | `total_vendor_spend_money` | Money | plumbing — sum of `purchase_orders` with status `placed` or `received` (committed spend only) |
+| `cash_on_hand_money` | Money | plumbing — operating cash: STARTING_CASH + Σ all-time pre-tax net revenue − committed vendor spend. The inventory agent's funds check reads this. |
 | `gross_margin_pct` | number | Billing |
 | `sales_pace_vs_baseline_pct` | number | Order-mgmt |
 | `top_movers` | obj[] | Order-mgmt — `{ item_id, qty, velocity }` |
-| `low_stock` | obj[] | Inventory — `{ ingredient_id, status }` |
-| `eighty_sixed_item_ids` | FK[]->menu_items | Inventory (derived) |
+| `low_stock` | obj[] | plumbing ONLY (`publish_availability` on every real stock change) — `{ ingredient_id, status }` |
+| `eighty_sixed_item_ids` | FK[]->menu_items | plumbing ONLY — an item stays 86'd until a delivery actually restocks it; placing a PO does not clear it (the agent must never write these fields) |
 | `active_promo_perf` | obj[] | Billing — `{ promo_id, predicted_uptake, actual_redemptions }` |
 
 ## `financials` (periodic rollups)
-Derived shift/day P&L. Written by Billing.
+Derived daily P&L. Written by **plumbing** (`plumbing/financials.py` backfill +
+`rollups.py` live upsert — deterministic math, invariant #3); read by Billing
+for margin context. Revenue is pre-tax (tax is a passthrough).
 
 | Field | Type | Notes |
 |---|---|---|
-| `period_id` | string | PK, e.g. `2026-06-14:dinner` |
+| `period_id` | string | PK, one per sim-day, e.g. `2026-06-14` |
 | `period_start` / `period_end` | timestamp | |
 | `gross_revenue_money` | Money | |
 | `cogs_money` | Money | From orders x recipes |
@@ -613,9 +631,9 @@ promotions.recommendation_id ──────► promotion_recommendations.rec
 
 | Agent | Reads | Writes |
 |---|---|---|
-| **Inventory** | raw_ingredients, recipes, vendors, orders (velocity) | purchase_orders, live_metrics (low_stock + 86), agent_events |
+| **Inventory** | raw_ingredients, recipes, vendors, orders (velocity) — via `stock_snapshot()` | purchase_orders |
 | **Order-mgmt** | orders, menu_items | live_metrics (sales pace, top movers), agent_events |
-| **Billing** | orders, menu_items, recipes, raw_ingredients, pricing_rules, customers (demographics + behavioral signals) | promotion_recommendations, promotions, live_metrics (margins), financials, agent_events |
+| **Billing** | orders, menu_items, recipes, raw_ingredients, pricing_rules, customers (demographics + behavioral signals), financials (margin context) | promotion_recommendations, promotions, live_metrics (margins), agent_events |
 | **Outreach** | customers, promotion_recommendations, promotions | campaign_sends (sends/pushes), agent_events |
 | **Central** | agent_events | promotion_recommendations (status on approval), agent_events |
-| **Pipeline (plumbing)** | recipes (for depletion), campaign_sends + orders (for reconciliation) | orders, raw_ingredients (deplete/replenish), live_metrics (base), campaign_sends (redemption reconciliation) |
+| **Pipeline (plumbing)** | recipes (for depletion), campaign_sends + orders (for reconciliation) | orders, raw_ingredients (deplete/replenish), live_metrics (base incl. cash on hand), financials (daily P&L), campaign_sends (redemption reconciliation) |

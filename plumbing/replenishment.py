@@ -29,6 +29,8 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from pymongo import MongoClient
 
+from plumbing.depletion import publish_availability
+
 load_dotenv()
 
 
@@ -66,6 +68,9 @@ def _process_po(db, po_id) -> bool:
     if claimed is None:
         return False
     _apply_replenishment(db, claimed)
+    # Restock changes availability — republish low_stock/86 so the dashboard
+    # reflects the delivery immediately (not on the next agent run).
+    publish_availability(db)
     return True
 
 
