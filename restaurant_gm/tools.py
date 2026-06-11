@@ -44,10 +44,19 @@ def _mongodb_mcp_connection() -> StdioConnectionParams:
     else:
         connection_string_with_db = f"{connection_string.rstrip('/')}/{db_name}"
 
+    # Call the server binary directly when it's preinstalled (the Docker image
+    # does `npm install -g mongodb-mcp-server`); fall back to npx locally.
+    # Inside Cloud Run, npx's registry checks/prompts in a stripped subprocess
+    # environment can hang the MCP stdio handshake.
+    import shutil
+    if shutil.which("mongodb-mcp-server"):
+        command, args = "mongodb-mcp-server", []
+    else:
+        command, args = "npx", ["-y", "mongodb-mcp-server"]
     return StdioConnectionParams(
         server_params=StdioServerParameters(
-            command="npx",
-            args=["-y", "mongodb-mcp-server"],
+            command=command,
+            args=args,
             env={"MDB_MCP_CONNECTION_STRING": connection_string_with_db},
         ),
     )

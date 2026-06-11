@@ -264,6 +264,20 @@ def sim_status():
             "paused": bool(ctl.get("paused"))}
 
 
+@app.get("/api/debug/llm")
+def debug_llm():
+    """Deploy diagnostics: is the model reachable from inside this container,
+    independent of the agent stack? Harmless read-only probe."""
+    try:
+        from google import genai
+        client = genai.Client()
+        r = client.models.generate_content(model="gemini-3.5-flash",
+                                           contents="reply with exactly: ok")
+        return {"ok": True, "reply": (r.text or "")[:50]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:500]}
+
+
 # Production build of the SPA, when present (dashboard/dist). Mounted last so
 # /api/* and the ADK routes win.
 _dist = _REPO_ROOT / "dashboard" / "dist"
