@@ -291,13 +291,16 @@ def _connect():
 def _rebuild_derived() -> None:
     """Restore all derived state after orders are deleted.
     Order matters: depletion resets stock to baseline first, then replenishment
-    layers received POs on top, then rollups recomputes metrics."""
+    layers received POs on top, then rollups recomputes metrics, then reconcile
+    recounts redemptions from the orders that remain."""
     from plumbing.depletion import rebuild as depletion_rebuild
+    from plumbing.reconcile import rebuild as reconcile_rebuild
     from plumbing.replenishment import rebuild as replenishment_rebuild
     from plumbing.rollups import rebuild as rollups_rebuild
     depletion_rebuild()
     replenishment_rebuild()
     rollups_rebuild()
+    reconcile_rebuild()
 
 
 def reset() -> None:
