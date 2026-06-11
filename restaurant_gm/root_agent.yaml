@@ -10,7 +10,7 @@
 # simultaneously; billing and outreach are called sequentially after.
 agent_class: LlmAgent
 name: central_orchestrator
-model: gemini-2.5-flash
+model: gemini-3.5-flash
 generate_content_config:
   temperature: 0
 description: >

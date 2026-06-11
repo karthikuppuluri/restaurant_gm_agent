@@ -1,10 +1,18 @@
 # Restaurant GM — Data Model
 
 ## TODO
+- [ ] Drop the 2h promo duration option (keep 24h/72h): configuration takes ~1 real minute and at demo SIM_SPEED the sim outruns a 2h window before the promo can even collect redemptions — billing YAML `duration_hours` choices + `get_sim_now` offsets
+- [ ] Sim clock regression: ▶ snaps the topbar to the new day's 12 AM, but the next change event (waste toss / PO received / `publish_availability` → live_metrics doc with the old `as_of`) reverts it to the last order's time until the first new order lands. Fix: make the dashboard clock monotonic (ignore incoming sim_now older than current) and/or stamp `as_of` at day start
+- [ ] Promo targeting stuck on one segment again: every promo shows just "opted-in only". Two parts: (1) display bug — `CriteriaPills` always appends "opted-in only", and for an open `{}` promo that's the ONLY pill, so it reads as targeted; open promos should show "open to everyone (incl. walk-ins)"; (2) verify billing on gemini-3.5-flash actually varies target_criteria run-to-run — if it ruts, add "do not repeat the previous promo's segment" using recent promos as context
+- [ ] **Financial realism redesign** — cash is too abundant and ingredient costs too low (e.g. $8/kg guacamole), so the inventory funds check never bites and every reorder sails through. Want: realistic vendor pricing, lower STARTING_CASH, and recurring cost drains (rent/labor per sim-day in financials + cash) so money is actually scarce → enables the demo drama: inventory consults billing about affordability, holds back orders, negotiates priorities ("cash is tight — which matters more, cheese or a promo discount budget?")
+- [ ] Outreach lag after "live!": promo goes live (Mode B) before outreach finishes its run (~30s later), and eligible customers/walk-ins can redeem the moment it's live — notification was never the redemption gate (see eligibility design note), so early redemptions are BY DESIGN, but document it on the dashboard (e.g. live card shows "notifying…" until sends land) so it doesn't look like a bug
+- [ ] Purchase orders table: cap height + scrollbar so older placed orders don't bury the panel (currently grows unbounded up to 10 rows)
+- [ ] Chat polish: collapse tool-call/agent-transfer activity lines into a blinking "show thinking…" collapsible (like LLM chat UIs) instead of printing raw MongoDB invocations inline; expanded view keeps the full trace for transparency
+- [ ] **✨ Analyze button on past promos** (agentic retro): each past-promo row gets an "Analyze" button → backend endpoint → worker-style Runner invocation → an agent post-mortem grounded in real data (predicted vs actual uptake, redemptions by segment from campaign_sends + orders, demand lift on the promoted items during the window vs before, margin impact from financials) answering: did it succeed or flop, WHY, what we learned, and what to do differently next time. Result lands in agent_events (or a `promo_retros` collection) and renders in the expanded promo detail — closes the recommend → approve → measure → LEARN loop
 - [ ] Add `max_tool_calls` (or equivalent ADK budget) to each agent YAML to hard-cap round-trips — order_mgmt=3, inventory=3, billing=4, outreach=2, central=8
 - [x] Fix Gemini `print(default_api.aggregate(...))` code-generation bug — fixed 2026-06-10 by moving all fixed-workflow reads to deterministic helper tools (`restaurant_gm/queries.py`, driver-backed, trivial/no arguments): the model no longer authors complex pipelines, which is exactly where the bug fired. Also set `temperature: 0` on every agent. MCP remains the write path + ad-hoc reads
 - [ ] Establish MIT License (hackathon requirement)
-- [ ] Order start times should follow a statistical distribution (e.g. lunch/dinner peaks) rather than uniform random
+- [x] Simulator realism (done 2026-06-11): Poisson arrivals with lunch/dinner peaks (HOURLY_RATE); item popularity learned empirically from the historical baseline (units sold per item — keeps live mix/margins consistent with seed history); known customers order their `favorite_item_ids` ~3× as often (makes affinity-targeted promos measurably real); line-item quantities skew low (mostly 1-2); plus promo demand-lift and availability gating
 - [ ] Demo sim plan: run ~7 sim-days at high SIM_SPEED (500-1000x) to show the full lifecycle in one shot — orders deplete stock → Inventory agent reorders → simulator auto-receives POs (lead_time_days from vendors schema) → Billing spots a pattern and recommends a promo → human approves → Outreach pushes → redemptions land on the dashboard
 - [x] `plumbing/reconcile.py` — done 2026-06-10: change-stream listener counts redemptions per order (`promotions.redemption_count`, `campaign_sends.redeemed` + `redeemed_order_id`, `live_metrics.active_promo_perf` actuals); idempotent via a `reconciled` claim flag; `--rebuild` recounts from facts and runs in the simulator's reset path
 - [x] `plumbing/worker.py` — done 2026-06-10: single-flight change-stream watcher invoking Central via the ADK Runner. Three triggers with suppression: (1) low stock → autonomous reorder (open-PO pre-check via `stock_snapshot()` + per-ingredient cooldown); (2) promo opportunity — `sales_pace_vs_baseline_pct` beyond ±15% (suppressed while a `pending` rec or `live` promo exists, global cooldown); (3) `promotion_recommendations.status` → `approved` → Billing Mode B + Outreach. Each run's final agent response is logged to `agent_events`
@@ -548,8 +556,23 @@ by Outreach to push. `redemption_count` reconciled from `campaign_sends`/`orders
 > `target_criteria` against the customer's profile to determine eligibility.
 > `campaign_sends` is a separate signal — "did we push this customer?" — which
 > raises their redemption probability but is not the gate. Walk-in customers
-> (`customer_id: null`) have no profile to match against and therefore cannot
-> redeem targeted promos.
+> (`customer_id: null`) have no profile to match against, so they cannot redeem
+> *targeted* promos — but an **open promo (empty `target_criteria: {}`) reaches
+> everyone, walk-ins included** (~40% of orders). Updated 2026-06-10: the
+> simulator also applies a per-promo **demand lift** (derived from a hash of the
+> promo_id: one third of promos get no lift, the rest 1.75×/2.5× item pick
+> weight) so predicted vs actual uptake genuinely diverges — some promos pop,
+> some flop, and the reconcile plumbing shows which.
+>
+> **Promo go-live timeline (clarified 2026-06-11):** the promo is LIVE the
+> moment Billing's Mode B inserts the `promotions` doc — like a discount hitting
+> the POS. From that instant, every eligible customer (and walk-ins, for open
+> promos) can redeem it at the register, *before* anyone is notified. Outreach
+> then runs (~30s later) as a **traffic driver, not a gate**: it pushes
+> SMS/email to the targeted, opted-in customers to pull them in, which boosts
+> their redemption probability (the campaign_sends 1.4× factor in the
+> simulator). Redemptions that land between go-live and the outreach push are
+> expected behavior, not a race condition.
 
 | Field | Type | Notes |
 |---|---|---|
@@ -581,8 +604,8 @@ covers) updated by plumbing; insight fields written by the agents.
 | `total_vendor_spend_money` | Money | plumbing — sum of `purchase_orders` with status `placed` or `received` (committed spend only) |
 | `cash_on_hand_money` | Money | plumbing — operating cash: STARTING_CASH + Σ all-time pre-tax net revenue − committed vendor spend. The inventory agent's funds check reads this. |
 | `gross_margin_pct` | number | Billing |
-| `sales_pace_vs_baseline_pct` | number | Order-mgmt |
-| `top_movers` | obj[] | Order-mgmt — `{ item_id, qty, velocity }` |
+| `sales_pace_vs_baseline_pct` | number | plumbing ONLY (rollups, recomputed per order via the same `sales_snapshot` derivation the agent reads — chat and dashboard always agree) |
+| `top_movers` | obj[] | plumbing ONLY (rollups) — `{ item_id, qty, velocity }` |
 | `low_stock` | obj[] | plumbing ONLY (`publish_availability` on every real stock change) — `{ ingredient_id, status }` |
 | `eighty_sixed_item_ids` | FK[]->menu_items | plumbing ONLY — an item stays 86'd until a delivery actually restocks it; placing a PO does not clear it (the agent must never write these fields) |
 | `active_promo_perf` | obj[] | Billing — `{ promo_id, predicted_uptake, actual_redemptions }` |
@@ -633,7 +656,7 @@ promotions.recommendation_id ──────► promotion_recommendations.rec
 | Agent | Reads | Writes |
 |---|---|---|
 | **Inventory** | raw_ingredients, recipes, vendors, orders (velocity) — via `stock_snapshot()` | purchase_orders |
-| **Order-mgmt** | orders, menu_items | live_metrics (sales pace, top movers), agent_events |
+| **Order-mgmt** | orders, menu_items — via `sales_snapshot()` | nothing (pure analyst; pace/top_movers are published by rollups plumbing) |
 | **Billing** | orders, menu_items, recipes, raw_ingredients, pricing_rules, customers (demographics + behavioral signals), financials (margin context) | promotion_recommendations, promotions, live_metrics (margins), agent_events |
 | **Outreach** | customers, promotion_recommendations, promotions | campaign_sends (sends/pushes), agent_events |
 | **Central** | agent_events | promotion_recommendations (status on approval), agent_events |

@@ -22,6 +22,7 @@ day streams in ~5 real minutes).
 """
 
 import argparse
+import hashlib
 import math
 import os
 import random
@@ -98,6 +99,10 @@ def _matches_criteria(customer: dict, criteria: dict) -> bool:
         required = set(criteria["dietary_flags"])
         if not required.intersection(set(customer.get("dietary_flags", []))):
             return False
+    if "favorite_item_ids" in criteria:
+        wanted = set(criteria["favorite_item_ids"])
+        if not wanted.intersection(set(customer.get("favorite_item_ids", []))):
+            return False
     return True
 
 
@@ -125,6 +130,26 @@ def _build_order(
     channel = random.choices(["DINE_IN", "TAKEOUT"], weights=[60, 40])[0]
     guest_count = random.randint(1, 6) if channel == "DINE_IN" else 1
 
+    # One live-promo lookup per order: it drives BOTH the demand lift on promoted
+    # items (below) and redemption eligibility (after the lines are built).
+    promo = db.promotions.find_one(
+        {"status": "live",
+         "valid_from": {"$lte": _ts(sim_now)},
+         "valid_until": {"$gte": _ts(sim_now)}},
+        {"_id": 0},
+    )
+
+    # Demand lift: a promo SOMETIMES makes its items more popular — and sometimes
+    # does nothing (real promos flop too). The factor is derived from a hash of
+    # the promo_id so it is stable for the promo's whole life and across ticks:
+    # one third of promos get no lift, the rest get 1.75x or 2.5x pick weight.
+    # This is what makes predicted vs actual uptake genuinely diverge.
+    lift, lifted_ids = 1.0, set()
+    if promo:
+        h = int(hashlib.md5(promo["promo_id"].encode()).hexdigest(), 16)
+        lift = 1.0 + 0.75 * (h % 3)
+        lifted_ids = set(promo.get("applies_to_item_ids", []))
+
     # Availability gate: a customer cannot order an item whose ingredients are
     # out (86 is derived from stock — invariant #2 — and the simulator must
     # respect it, otherwise depletion drives on_hand_qty negative). `stock` is a
@@ -142,7 +167,17 @@ def _build_order(
     if not available:
         return None  # everything is 86'd — customer turned away
     avail_items = [x[0] for x in available]
-    avail_weights = [x[1] for x in available]
+    avail_weights = [w * lift if it["item_id"] in lifted_ids else w
+                     for it, w in available]
+
+    # Personal taste: a known customer orders their favorites ~3x as often —
+    # this is what makes affinity-targeted promos measurably real (taco fans
+    # actually buy tacos).
+    if customer:
+        favs = set(customer.get("favorite_item_ids", []))
+        if favs:
+            avail_weights = [w * 3 if it["item_id"] in favs else w
+                             for it, w in zip(avail_items, avail_weights)]
 
     chosen_items = random.choices(avail_items, weights=avail_weights, k=random.randint(1, 4))
     line_items = []
@@ -150,7 +185,9 @@ def _build_order(
         cap = _can_make(item["item_id"])
         if cap < 1:
             continue  # an earlier line in this order used up the stock
-        qty = min(random.randint(1, 6), cap)
+        # Quantity skews low: mostly 1-2 of an item, big multiples are rare.
+        qty = min(random.choices([1, 2, 3, 4, 5, 6],
+                                 weights=[45, 28, 14, 7, 4, 2])[0], cap)
         for ing_id, need in bom[item["item_id"]].items():
             stock[ing_id] = stock.get(ing_id, 0) - need * qty
         price = price_map[item["item_id"]]
@@ -168,19 +205,12 @@ def _build_order(
     if not line_items:
         return None
 
-    # Promo awareness — dormant until a live promotions doc exists.
-    # Eligibility is determined by promotions.target_criteria, not campaign_sends.
-    # campaign_sends is a probability boost only.
-    if customer_id and customer:
-        promo = db.promotions.find_one(
-            {
-                "status": "live",
-                "valid_from": {"$lte": _ts(sim_now)},
-                "valid_until": {"$gte": _ts(sim_now)},
-            },
-            {"_id": 0},
-        )
-        if promo and _matches_criteria(customer, promo.get("target_criteria", {})):
+    # Redemption — eligibility is promotions.target_criteria, not campaign_sends
+    # (the push is only a probability boost). Walk-ins have no profile, so they
+    # can redeem ONLY open promos (empty criteria — _matches_criteria({}, {}) is
+    # True, while any profile-keyed criteria correctly excludes them).
+    if promo and _matches_criteria(customer or {}, promo.get("target_criteria", {})):
+        if customer:
             p_redeem = customer.get("price_sensitivity", 0.5)
             has_send = db.campaign_sends.find_one(
                 {"promo_id": promo["promo_id"], "customer_id": customer_id},
@@ -188,19 +218,26 @@ def _build_order(
             )
             if has_send:
                 p_redeem = min(1.0, p_redeem * 1.4)
+            # Affinity: a promo on an item this customer already loves converts
+            # better — this is what makes WELL-TARGETED promos systematically
+            # beat mistargeted ones (on top of the random per-promo lift).
+            if set(promo.get("applies_to_item_ids", [])) & set(customer.get("favorite_item_ids", [])):
+                p_redeem = min(1.0, p_redeem * 1.5)
+        else:
+            p_redeem = 0.4  # walk-ins notice in-store signage, no push boost
 
-            if random.random() < p_redeem:
-                eligible_ids = set(promo.get("applies_to_item_ids", []))
-                dtype = promo.get("discount_type", "PERCENTAGE")
-                dvalue = promo.get("discount_value", 0)
-                for li in line_items:
-                    if li["item_id"] in eligible_ids:
-                        if dtype == "PERCENTAGE":
-                            disc = li["unit_price_money"]["amount"] * li["quantity"] * dvalue // 100
-                        else:
-                            disc = dvalue * li["quantity"]
-                        li["applied_discount_money"] = _money(disc)
-                        li["promo_id"] = promo["promo_id"]
+        if random.random() < p_redeem:
+            eligible_ids = set(promo.get("applies_to_item_ids", []))
+            dtype = promo.get("discount_type", "PERCENTAGE")
+            dvalue = promo.get("discount_value", 0)
+            for li in line_items:
+                if li["item_id"] in eligible_ids:
+                    if dtype == "PERCENTAGE":
+                        disc = li["unit_price_money"]["amount"] * li["quantity"] * dvalue // 100
+                    else:
+                        disc = dvalue * li["quantity"]
+                    li["applied_discount_money"] = _money(disc)
+                    li["promo_id"] = promo["promo_id"]
 
     total_gross = sum(li["gross_money"]["amount"] for li in line_items)
     total_discount = sum(li["applied_discount_money"]["amount"] for li in line_items)
@@ -231,6 +268,57 @@ def _build_order(
         "created_at": _ts(sim_now),
         "updated_at": _ts(closed),
     }
+
+
+# ── spoilage ──────────────────────────────────────────────────────────────────
+
+def _spoilage_pass(db, sim_now: datetime) -> int:
+    """Daily spoilage, run once at the start of each simulated day (BEFORE the
+    morning deliveries land). No-lot-tracking approximation of FIFO expiry:
+    stock beyond what current demand can consume within an ingredient's
+    shelf_life_days is "old", and roughly 1/shelf_life of that excess expires
+    each day (gradual decay, not a cliff). Every toss is logged to waste_events
+    — the recurring cost signal that lets the Inventory agent learn what not to
+    keep buying. Deterministic plumbing (invariant #3)."""
+    from restaurant_gm.queries import _ingredient_usage_per_hour
+    usage = _ingredient_usage_per_hour(db, _ts(sim_now))
+    n, total_cents = 0, 0
+    for r in db.raw_ingredients.find({}, {"ingredient_id": 1, "name": 1, "unit": 1,
+                                          "on_hand_qty": 1, "reorder_point": 1,
+                                          "shelf_life_days": 1, "unit_cost_money": 1}):
+        shelf = r.get("shelf_life_days")
+        if not shelf:
+            continue
+        daily = usage.get(r["ingredient_id"], 0) * 24
+        # what demand can consume before it expires (floored at the reorder point
+        # so normal working stock isn't tossed)
+        keep = max(daily * shelf, r.get("reorder_point", 0))
+        excess = r["on_hand_qty"] - keep
+        waste = round(excess / shelf, 3) if excess > 0 else 0
+        if waste < 0.05:
+            continue
+        cost = round(waste * r["unit_cost_money"]["amount"])
+        db.raw_ingredients.update_one(
+            {"_id": r["ingredient_id"]},
+            [{"$set": {"on_hand_qty": {"$max": [0, {"$round": [
+                {"$subtract": ["$on_hand_qty", waste]}, 3]}]},
+                "updated_at": _ts(sim_now)}}],
+        )
+        db.waste_events.insert_one({
+            "waste_id": f"waste_{uuid.uuid4().hex[:8]}",
+            "ingredient_id": r["ingredient_id"], "name": r["name"], "unit": r["unit"],
+            "qty": waste, "cost_cents": cost,
+            "day": _ts(sim_now)[:10],
+            "reason": "past shelf life",
+            "created_at": _ts(sim_now),
+            "source": "simulator", "schema_version": 1,
+        })
+        n += 1
+        total_cents += cost
+    if n:
+        print(f"  [WASTE] start of day: tossed {n} ingredient(s) past shelf life — "
+              f"${total_cents / 100:.2f}")
+    return n
 
 
 # ── PO receipt ────────────────────────────────────────────────────────────────
@@ -312,7 +400,7 @@ def reset() -> None:
         res = db.orders.delete_many({"source": "simulator"})
         cleared = []
         for coll in ("purchase_orders", "promotion_recommendations", "promotions",
-                     "campaign_sends", "agent_events"):
+                     "campaign_sends", "agent_events", "waste_events"):
             n = db[coll].delete_many({}).deleted_count
             if n:
                 cleared.append(f"{coll}={n}")
@@ -406,9 +494,16 @@ def run() -> None:
     if not items:
         raise RuntimeError("No menu_items found — run seed_data.py first")
 
-    # Item selection weights: high_margin tag → weight 3, everything else → 1.
-    # The seed data uses no 'popular' tag; high_margin is the closest proxy.
-    item_weights = [3 if "high_margin" in item.get("tags", []) else 1 for item in items]
+    # Item popularity learned FROM THE DATA: weight = units sold in the
+    # historical baseline. Keeps the live order mix consistent with the seed
+    # history (same margins, same top sellers) instead of an arbitrary tag rule.
+    hist = {h["_id"]: h["qty"] for h in db.orders.aggregate([
+        {"$match": {"source": {"$ne": "simulator"}}},
+        {"$unwind": "$line_items"},
+        {"$group": {"_id": "$line_items.item_id",
+                    "qty": {"$sum": "$line_items.quantity"}}},
+    ])}
+    item_weights = [max(hist.get(item["item_id"], 1), 1) for item in items]
     price_map = {item["item_id"]: item["price_money"]["amount"] for item in items}
     name_map = {item["item_id"]: item["name"] for item in items}
 
@@ -434,6 +529,9 @@ def run() -> None:
     print(f"  {len(items)} items  {len(customers)} customers  tax={tax_rate_bps}bps")
     print("  Closed hours fast-forward; orders stream during service. Ctrl-C to stop early.\n")
 
+    # Start-of-day spoilage (before the morning deliveries land at the open jump).
+    _spoilage_pass(db, sim_now)
+
     n_orders = 0
     announced_pause = False
     last_pause_poll = 0.0
@@ -441,6 +539,21 @@ def run() -> None:
         while sim_now < day_end:
             tick_start = time.monotonic()
             sim_now += timedelta(seconds=SIM_STEP)
+
+            # Closed hours: JUMP straight to the next open hour instead of grinding
+            # through 60 no-op ticks per hour — each tick costs two Atlas round-trips
+            # (PO receive + promo expiry), which made the "fast-forward" take a
+            # minute-plus of dead silence and look like the sim was hung. The PO/promo
+            # checks below run at the jump destination, so anything due during the
+            # closed stretch (e.g. the 08:00 morning delivery) is still picked up.
+            if HOURLY_RATE.get(sim_now.hour, 0) == 0:
+                nxt = sim_now.replace(minute=0, second=0)
+                while nxt < day_end and HOURLY_RATE.get(nxt.hour, 0) == 0:
+                    nxt += timedelta(hours=1)
+                nxt = min(nxt, day_end)
+                if nxt > sim_now:
+                    print(f"  [closed] {_ts(sim_now)} → jumping to {_ts(nxt)}")
+                    sim_now = nxt
 
             # Auto-receive any POs whose expected_delivery has passed.
             received = _receive_overdue_pos(db, sim_now)

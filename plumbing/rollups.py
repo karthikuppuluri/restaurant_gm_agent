@@ -8,6 +8,12 @@ Keeps the singleton `live_metrics` document's BASE fields current:
   - cash_on_hand_money        (STARTING_CASH + all-time net revenue - vendor spend)
   - as_of                     (SIM time = opened_at of the latest order, NOT wall clock)
 
+Also recomputed per order (moved here from the order_mgmt agent 2026-06-10 —
+pure derivation, single writer, never stale; the agent reads the same
+sales_snapshot() helper so chat and dashboard always agree):
+  - sales_pace_vs_baseline_pct  (trailing 2h vs the seed baseline, same hours)
+  - top_movers                  ({ item_id, qty, velocity })
+
 Also upserts the current sim-day's `financials` doc on each order insert (the
 daily P&L lives in plumbing/financials.py; this listener just keeps "today"
 current). Note: a PO insert changes vendor spend / cash but is only picked up
@@ -24,9 +30,9 @@ base fields. This is inherently idempotent (a restart can't double-count) and ma
 `rebuild()` the exact same operation — which keeps live_metrics consistent after the
 simulator's --reset/--undo (memory: reset-rolls-back-derived-state).
 
-Only the base fields are written (via `$set` on those keys). Agent-owned fields —
-gross_margin_pct, sales_pace, top_movers, low_stock, eighty_sixed_item_ids,
-active_promo_perf — are never touched here (invariant #3).
+Only the listed fields are written (via `$set` on those keys). Agent-owned fields —
+gross_margin_pct, active_promo_perf — are never touched here (invariant #3);
+low_stock / eighty_sixed_item_ids are owned by depletion/replenishment plumbing.
 
 Usage:
     python -m plumbing.rollups              # sync once, then watch the stream
@@ -46,6 +52,7 @@ from plumbing.financials import (
     item_maps,
     rollup_day,
 )
+from restaurant_gm.queries import sales_snapshot
 
 load_dotenv()
 
@@ -112,6 +119,15 @@ def _recompute(db) -> dict:
     ]))
     all_net = (all_agg[0]["gross"] - all_agg[0]["discount"]) if all_agg else 0
     cash = STARTING_CASH_CENTS + all_net - vendor_spend
+
+    # Sales pace + top movers: same derivation the order_mgmt agent reads via
+    # sales_snapshot(), recomputed here per order so the dashboard is never stale.
+    snap = sales_snapshot(2)
+    pace = snap.get("pace_vs_baseline_pct")
+    top_movers = [{"item_id": m["item_id"], "qty": m["qty"],
+                   "velocity": m["velocity_per_hour"]}
+                  for m in snap.get("top_items", [])]
+
     db.live_metrics.update_one(
         {"_id": _LIVE_ID},
         {
@@ -120,6 +136,8 @@ def _recompute(db) -> dict:
                 "covers": covers,
                 "total_vendor_spend_money": _money(vendor_spend),
                 "cash_on_hand_money": _money(cash),
+                "sales_pace_vs_baseline_pct": pace,
+                "top_movers": top_movers,
                 "as_of": as_of,
                 "updated_at": now,
             },

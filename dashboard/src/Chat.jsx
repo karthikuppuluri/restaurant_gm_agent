@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import Md from './Markdown.jsx'
 
 const APP = 'restaurant_gm'
 const USER = 'gm'
@@ -132,7 +133,9 @@ export default function Chat() {
           ) : (
             <div key={i} className={`bubble ${it.kind}`}>
               {it.kind === 'agent' && <div className="bubble-author">{it.author}</div>}
-              <div className="bubble-text">{it.text}</div>
+              <div className="bubble-text">
+                {it.kind === 'agent' ? <Md text={it.text} /> : it.text}
+              </div>
             </div>
           )
         )}

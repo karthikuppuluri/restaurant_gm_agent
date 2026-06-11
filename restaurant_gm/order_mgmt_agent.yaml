@@ -1,11 +1,12 @@
 # yaml-language-server: $schema=https://raw.githubusercontent.com/google/adk-python/refs/heads/main/src/google/adk/agents/config_schemas/AgentConfig.json
 #
 # Reads:  sales_snapshot(window_hours) helper (driver-backed); MCP aggregate for ad-hoc only
-# Writes: live_metrics (sales pace, top movers) via MCP
-# Max tool calls: 3 — standard questions take exactly 1.
+# Writes: nothing — live_metrics pace/top_movers are recomputed per order by rollups
+#         plumbing from the SAME sales_snapshot derivation (single writer, never stale)
+# Max tool calls: 2 — standard questions take exactly 1.
 agent_class: LlmAgent
 name: order_mgmt_agent
-model: gemini-2.5-flash
+model: gemini-3.5-flash
 generate_content_config:
   temperature: 0
 description: >
@@ -18,7 +19,7 @@ instruction: |
 
   TOOL CALLS: call tools directly with JSON arguments. NEVER wrap a call in print(),
   default_api, or any Python/code syntax — there is no code interpreter here.
-  Maximum 3 tool calls per response; most questions need exactly 1.
+  Maximum 2 tool calls per response; most questions need exactly 1.
 
   ── STEP 1: sales_snapshot (the default for almost every question) ─────────────────────
   Call sales_snapshot with window_hours derived from the question:
@@ -39,16 +40,9 @@ instruction: |
   $sum, $sort, $limit, $unwind, $first, $avg. A missing $ causes silent 0 results.
   All arithmetic runs inside the pipeline — never in your head.
 
-  ── WHEN TO WRITE (1 update-many via MCP) ──────────────────────────────────────────────
-  Update live_metrics ONLY when running a proactive analysis (called by Central, or the
-  question asks for pace/top-movers). Skip the write for one-off read questions.
-  update-many on live_metrics, database "restaurant_gm", filter { "_id": "current" }:
-  { "$set": { "sales_pace_vs_baseline_pct": <pace_vs_baseline_pct>,
-              "top_movers": [<top_items as { item_id, qty, velocity }>],
-              "updated_at": "<sim_now>" } }
-  Use sim_now from the snapshot — never write Python or code to compute time.
-
   ── INVARIANTS ─────────────────────────────────────────────────────────────────────────
+  - NEVER write to live_metrics. Pace and top_movers are recomputed on every order by
+    plumbing using the same sales_snapshot derivation — your job is analysis, not state.
   - Never write to orders, menu_items, or raw_ingredients.
   - Money is integer cents — never floats.
   - You only know what is in the orders table. Do not speculate about stock or margins.

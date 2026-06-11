@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import Chat from './Chat.jsx'
+import Md from './Markdown.jsx'
 import { useFeed } from './useFeed.js'
 import { fmtMoney, fmtSimTime, fmtDay, itemName, ingName, vendorName, pct } from './lib.js'
 
@@ -11,6 +12,7 @@ export default function App() {
       <header className="topbar">
         <div className="brand">🌮 Restaurant GM</div>
         <div className="topbar-right">
+          <SimControl onDayStart={feed.setSimNow} />
           <span className="sim-clock">sim {fmtSimTime(feed.sim_now)}</span>
           <span className={`dot ${feed.connected ? 'on' : 'off'}`} />
         </div>
@@ -18,12 +20,13 @@ export default function App() {
       <main className="layout">
         <section className="left">
           <StatRow lm={feed.live_metrics} />
+          <OrderStream orders={feed.orders} />
           <PromoSection recommendations={feed.recommendations} promotions={feed.promotions}
             sends={feed.sends_seen} />
           <div className="two-col">
             <FinancialsChart financials={feed.financials} />
             <StockPanel lm={feed.live_metrics} ingredients={feed.raw_ingredients}
-              pos={feed.purchase_orders} />
+              pos={feed.purchase_orders} wasteCents={feed.waste_7d_cents} />
           </div>
           <POPanel pos={feed.purchase_orders} />
           <AgentActivity events={feed.agent_events} />
@@ -32,6 +35,116 @@ export default function App() {
           <Chat />
         </aside>
       </main>
+    </div>
+  )
+}
+
+// The demo knob: pick how many real minutes one simulated day takes, hit Run.
+function SimControl({ onDayStart }) {
+  const [minutes, setMinutes] = useState(5)
+  const [running, setRunning] = useState(false)
+  const [paused, setPaused] = useState(false)
+  const [warming, setWarming] = useState(false)
+  const pollRef = useRef(null)
+
+  async function refresh() {
+    try {
+      const r = await fetch('/api/sim/status')
+      const j = await r.json()
+      setRunning(j.running)
+      setPaused(j.paused)
+      if (!j.running && pollRef.current) {
+        clearInterval(pollRef.current)
+        pollRef.current = null
+      }
+    } catch { /* backend briefly away — keep last state */ }
+  }
+
+  useEffect(() => {
+    refresh()
+    return () => pollRef.current && clearInterval(pollRef.current)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  async function start() {
+    const r = await fetch('/api/sim/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ day_minutes: minutes }),
+    })
+    if (r.ok) {
+      const j = await r.json()
+      setRunning(true)
+      setPaused(false)
+      // snap the clock to the new day so the judge SEES the day turn over,
+      // and show a brief warming-up note while the simulator boots
+      if (j.sim_day_start) onDayStart?.(j.sim_day_start)
+      setWarming(true)
+      setTimeout(() => setWarming(false), 12000)
+      if (!pollRef.current) pollRef.current = setInterval(refresh, 5000)
+    }
+  }
+
+  async function stop() {
+    await fetch('/api/sim/stop', { method: 'POST' })
+    setRunning(false)
+    setPaused(false)
+  }
+
+  async function togglePause() {
+    const next = !paused
+    await fetch(`/api/sim/${next ? 'pause' : 'resume'}`, { method: 'POST' })
+    setPaused(next)
+  }
+
+  return (
+    <span className="sim-control">
+      {!running && (
+        <select value={minutes} onChange={(e) => setMinutes(Number(e.target.value))}>
+          <option value={2}>1 day ≈ 2 min</option>
+          <option value={5}>1 day ≈ 5 min</option>
+          <option value={10}>1 day ≈ 10 min</option>
+          <option value={20}>1 day ≈ 20 min</option>
+        </select>
+      )}
+      {!running && <button className="sim-btn" onClick={start}>▶ Run a day</button>}
+      {running && (
+        <>
+          <button className="sim-btn pause" onClick={togglePause}>
+            {paused ? '▶ Resume' : '⏸ Pause'}
+          </button>
+          <button className="sim-btn stop" onClick={stop}>⏹ Stop</button>
+          <span className={`sim-running ${paused ? 'paused' : ''}`}>
+            {paused ? 'paused'
+              : warming ? 'starting up — orders begin streaming in a few seconds…'
+              : 'day in progress…'}
+          </span>
+        </>
+      )}
+    </span>
+  )
+}
+
+// The restaurant's pulse: the last 5 orders as they land.
+function OrderStream({ orders }) {
+  if (!orders || orders.length === 0) return null
+  return (
+    <div className="panel order-stream">
+      <div className="panel-title">Order stream <span className="muted">(last 5)</span></div>
+      {orders.map((o) => {
+        const items = (o.line_items || [])
+          .map((li) => `${li.quantity}× ${li.name}`).join(', ')
+        const redeemed = (o.line_items || []).some((li) => li.promo_id)
+        return (
+          <div key={o.order_id} className="order-row">
+            <span className="order-time">{fmtSimTime(o.opened_at)}</span>
+            <span className="order-channel">{o.channel === 'DINE_IN' ? '🍽' : '🥡'}</span>
+            <span className="order-items" title={items}>{items}</span>
+            {redeemed && <span className="pill target">🎟 promo</span>}
+            <b className="order-net">{fmtMoney(o.net_amount_money)}</b>
+          </div>
+        )
+      })}
     </div>
   )
 }
@@ -68,14 +181,18 @@ function AgentActivity({ events }) {
       <div className="panel-title">Agent activity <span className="muted">(autonomous actions, in the agent's own words)</span></div>
       {events.slice(0, 6).map((e) => (
         <div key={e.event_id} className="activity-row">
-          <span className="activity-icon">{AGENT_ICONS[e.agent] || '🤖'}</span>
+          <span className="activity-icon">
+            {e.phase === 'started' ? '⚙️' : AGENT_ICONS[e.agent] || '🤖'}
+          </span>
           <div className="activity-body">
             <div className="activity-head">
-              <b>{e.agent} agent</b>
+              <b>{e.phase === 'started' ? 'working' : `${e.agent} agent`}</b>
               <span className="pill">{e.action?.replaceAll('_', ' ')}</span>
               <span className="muted activity-time">{fmtSimTime(e.created_at)}</span>
             </div>
-            <div className="activity-text">{e.reasoning || e.summary}</div>
+            <div className={`activity-text ${e.phase === 'started' ? 'working' : ''}`}>
+              <Md text={e.reasoning || e.summary} />
+            </div>
           </div>
         </div>
       ))}
@@ -91,7 +208,7 @@ function StatRow({ lm }) {
       <Stat label="Covers" value={lm.covers ?? '—'} />
       <Stat label="Operating cash" value={fmtMoney(lm.cash_on_hand_money, { compact: true })} />
       <Stat label="Vendor spend" value={fmtMoney(lm.total_vendor_spend_money, { compact: true })} />
-      <Stat label="Pace vs baseline" value={pct(pace)}
+      <Stat label="Pace vs baseline (last 2h)" value={pct(pace)}
         tone={pace > 0 ? 'good' : pace < 0 ? 'bad' : ''} />
     </div>
   )
@@ -106,13 +223,37 @@ function Stat({ label, value, tone = '' }) {
   )
 }
 
+// "X redeemed / Y notified · actual uptake A% vs predicted P%" — both percentages
+// are shares of NOTIFIED customers (open promos can exceed 100% via walk-ins).
+function uptakeLine(promo) {
+  const red = promo.redemption_count ?? 0
+  const notified = promo.notified_count || 0
+  const actual = notified ? Math.round((red / notified) * 100) : null
+  const pred = promo.predicted_uptake != null ? Math.round(promo.predicted_uptake * 100) : null
+  return (
+    <>
+      redeemed <b>{red}</b>{notified > 0 && <> / {notified} notified</>}
+      {actual != null && <> · actual uptake <b>{actual}%</b></>}
+      {pred != null && <> vs predicted <b>{pred}%</b></>}
+      {notified > 0 && <span className="muted"> (% of notified)</span>}
+    </>
+  )
+}
+
 function PromoSection({ recommendations, promotions, sends }) {
   const [expandedId, setExpandedId] = useState(null)
   const pending = recommendations.filter((r) => r.status === 'pending')
-  const decided = recommendations.filter((r) => r.status !== 'pending').slice(0, 5)
   const live = promotions.filter((p) => p.status === 'live')
   const past = promotions.filter((p) => p.status !== 'live').slice(0, 4)
-  const expanded = decided.find((r) => r.recommendation_id === expandedId)
+  // A recommendation pill only lingers up top while it has NO promo yet
+  // (rejected, or approved-and-still-configuring). Once the promo exists its
+  // whole story lives on the live card / in Past promos.
+  const configured = new Set(promotions.map((p) => p.recommendation_id))
+  const decided = recommendations.filter(
+    (r) => r.status === 'rejected' ||
+      (r.status === 'approved' && !configured.has(r.recommendation_id))
+  ).slice(0, 5)
+  const expandedRec = decided.find((r) => r.recommendation_id === expandedId)
   return (
     <div className="panel">
       <div className="panel-title">
@@ -133,31 +274,33 @@ function PromoSection({ recommendations, promotions, sends }) {
               onClick={() => setExpandedId(
                 expandedId === r.recommendation_id ? null : r.recommendation_id)}
             >
-              {r.proposal?.title} — {r.status} {expandedId === r.recommendation_id ? '▾' : '▸'}
+              {r.proposal?.title} — {r.status === 'approved' ? 'configuring…' : r.status}
+              {' '}{expandedId === r.recommendation_id ? '▾' : '▸'}
             </button>
           ))}
         </div>
       )}
-      {expanded && (
-        <PromoDetail
-          rec={expanded}
-          promo={promotions.find((p) => p.recommendation_id === expanded.recommendation_id)}
-        />
-      )}
+      {expandedRec && <PromoDetail rec={expandedRec} promo={null} />}
       {past.length > 0 && (
         <div className="past-promos">
-          <div className="stock-head">Past promos</div>
+          <div className="stock-head">Past promos ({past.length}) — click to expand</div>
           {past.map((p) => (
-            <div key={p.promo_id} className="past-promo-row"
-              title={`Targets: ${JSON.stringify(p.target_criteria)}`}>
-              <span>{p.title}</span>
-              <span className="pill">{p.discount_value}% off</span>
-              <ItemPills ids={(p.applies_to_item_ids || []).slice(0, 2)} />
-              <span className="muted">{fmtSimTime(p.valid_from)} – {fmtSimTime(p.valid_until)}</span>
-              <span className="redemptions">
-                {p.redemption_count ?? 0} redeemed
-                {p.predicted_uptake != null && ` · predicted ${Math.round(p.predicted_uptake * 100)}%`}
-              </span>
+            <div key={p.promo_id}>
+              <button
+                className={`past-promo-row clickable ${expandedId === p.promo_id ? 'open' : ''}`}
+                onClick={() => setExpandedId(expandedId === p.promo_id ? null : p.promo_id)}
+              >
+                <span>{expandedId === p.promo_id ? '▾' : '▸'} {p.title}</span>
+                <span className="pill">{p.discount_value}% off</span>
+                <span className="muted">{fmtSimTime(p.valid_from)} – {fmtSimTime(p.valid_until)}</span>
+                <span className="redemptions">{uptakeLine(p)}</span>
+              </button>
+              {expandedId === p.promo_id && (
+                <PromoDetail
+                  rec={recommendations.find((r) => r.recommendation_id === p.recommendation_id)}
+                  promo={p}
+                />
+              )}
             </div>
           ))}
         </div>
@@ -251,10 +394,17 @@ function RecommendationCard({ rec }) {
   )
 }
 
-// Read-only expanded view of a decided recommendation + its resulting promo.
+// Read-only expanded view: a decided recommendation and/or its resulting promo.
+// Either side may be missing (rec scrolled out of the feed, or promo not yet
+// configured) — falls back to whichever document exists.
 function PromoDetail({ rec, promo }) {
-  const p = rec.proposal || {}
-  const just = rec.justification || {}
+  const p = rec?.proposal || {
+    title: promo?.title, description: promo?.description,
+    discount_value: promo?.discount_value,
+    applies_to_item_ids: promo?.applies_to_item_ids,
+    target_criteria: promo?.target_criteria,
+  }
+  const just = rec?.justification || {}
   const pred = just.predictive || {}
   return (
     <div className="rec-card detail">
@@ -284,14 +434,11 @@ function PromoDetail({ rec, promo }) {
         ))}
       </ul>
       <div className="rec-pred">
-        {rec.status} by <b>{rec.decided_by || '—'}</b> at {fmtSimTime(rec.decided_at)}
+        {rec && <>{rec.status} by <b>{rec.decided_by || '—'}</b> at {fmtSimTime(rec.decided_at)}</>}
         {promo ? <>
-          {' · '}promo <b>{promo.status}</b> {fmtSimTime(promo.valid_from)} → {fmtSimTime(promo.valid_until)}
-          {' · '}redemptions <b>{promo.redemption_count ?? 0}</b>
-          {pred.predicted_uptake != null && <>
-            {' · '}predicted uptake <b>{Math.round(pred.predicted_uptake * 100)}%</b>
-          </>}
-        </> : rec.status === 'approved' ? ' · promo configuring…' : null}
+          {rec && ' · '}promo <b>{promo.status}</b> {fmtSimTime(promo.valid_from)} → {fmtSimTime(promo.valid_until)}
+          {' · '}{uptakeLine(promo)}
+        </> : rec?.status === 'approved' ? ' · promo configuring…' : null}
       </div>
     </div>
   )
@@ -320,10 +467,7 @@ function LivePromo({ promo }) {
       </div>
       <div className="rec-pred">
         live {fmtSimTime(promo.valid_from)} → {fmtSimTime(promo.valid_until)}
-        {' · '}redemptions <b>{promo.redemption_count ?? 0}</b>
-        {promo.predicted_uptake != null && <>
-          {' · '}predicted uptake <b>{Math.round(promo.predicted_uptake * 100)}%</b>
-        </>}
+        {' · '}{uptakeLine(promo)}
         {' · '}approved by <b>{promo.approved_by || '—'}</b>
       </div>
     </div>
@@ -354,7 +498,7 @@ function FinancialsChart({ financials }) {
   )
 }
 
-function StockPanel({ lm, ingredients = [], pos = [] }) {
+function StockPanel({ lm, ingredients = [], pos = [], wasteCents = 0 }) {
   const low = lm.low_stock || []
   const dead = lm.eighty_sixed_item_ids || []
   // ingredients covered by an open PO get an "on order" badge
@@ -366,7 +510,14 @@ function StockPanel({ lm, ingredients = [], pos = [] }) {
     stockRank(a) - stockRank(b) || (a.name || '').localeCompare(b.name || ''))
   return (
     <div className="panel">
-      <div className="panel-title">Stock & supply</div>
+      <div className="panel-title">
+        Stock & supply
+        {wasteCents > 0 && (
+          <span className="pill warn" title="spoilage cost, trailing 7 sim-days">
+            🗑 {fmtMoney(wasteCents)} wasted (7d)
+          </span>
+        )}
+      </div>
       {dead.length > 0 && (
         <div className="stock-block">
           <div className="stock-head bad">86'd ({dead.length})</div>
@@ -450,7 +601,7 @@ function POPanel({ pos }) {
         </thead>
         <tbody>
           {pos.map((p) => (
-            <tr key={p.po_id}>
+            <tr key={p._id || p.po_id}>
               <td><span className={`pill ${p.status === 'received' ? 'approved' : 'warn'}`}>{p.status}</span></td>
               <td>{vendorName(p.vendor_id)}</td>
               <td className="po-items">

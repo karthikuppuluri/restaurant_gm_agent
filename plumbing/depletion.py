@@ -164,10 +164,17 @@ def rebuild() -> None:
             for ing_id, amt in _depletion_for_order(order, item_to_recipe, recipes).items():
                 totals[ing_id] = totals.get(ing_id, 0) + amt
         _apply_depletion(db, totals)
+
+        # 3. Re-apply spoilage from waste_events — they are facts, like orders.
+        waste_totals = {w["_id"]: w["q"] for w in db.waste_events.aggregate(
+            [{"$group": {"_id": "$ingredient_id", "q": {"$sum": "$qty"}}}])}
+        if waste_totals:
+            _apply_depletion(db, waste_totals)
         publish_availability(db)
 
         n = db.orders.count_documents({"source": "simulator"})
-        print(f"Rebuilt stock: reset to baseline, re-depleted from {n} simulator orders.")
+        print(f"Rebuilt stock: reset to baseline, re-depleted from {n} simulator orders, "
+              f"re-applied waste for {len(waste_totals)} ingredient(s).")
     finally:
         client.close()
 

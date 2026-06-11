@@ -116,6 +116,15 @@ def rollup_day(db, day: str, cost_map: dict, cat_map: dict):
 
     net = gross - discount
     margin_pct = round((net - cogs) / net * 100, 1) if net else 0.0
+
+    # Spoilage cost for the day (waste_events from the simulator's start-of-day
+    # pass) — surfaced alongside the P&L, not folded into margin.
+    w = list(db.waste_events.aggregate([
+        {"$match": {"day": day}},
+        {"$group": {"_id": None, "c": {"$sum": "$cost_cents"}}},
+    ]))
+    waste_cents = w[0]["c"] if w else 0
+
     by_category = [
         {"category": c, "revenue_money": _money(rev),
          "margin_pct": round((rev - cg) / rev * 100, 1) if rev else 0.0}
@@ -135,6 +144,7 @@ def rollup_day(db, day: str, cost_map: dict, cat_map: dict):
                 "discount_money": _money(discount),
                 "net_revenue_money": _money(net),
                 "gross_margin_pct": margin_pct,
+                "waste_money": _money(waste_cents),
                 "by_category": by_category,
                 "updated_at": now,
             },

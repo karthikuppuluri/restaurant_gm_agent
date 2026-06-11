@@ -20,7 +20,9 @@ dashboard/dist is served statically at / when present.
 import asyncio
 import json
 import os
-from datetime import datetime, timezone
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -47,6 +49,8 @@ _FEED_COLLECTIONS = [
     "campaign_sends",
     "agent_events",
     "raw_ingredients",
+    "orders",
+    "waste_events",
 ]
 
 _client = MongoClient(
@@ -54,6 +58,29 @@ _client = MongoClient(
     serverSelectionTimeoutMS=10000, connectTimeoutMS=10000,
 )
 _db = _client[os.environ.get("MONGODB_DB_NAME", "restaurant_gm")]
+
+
+def _ensure_indexes() -> None:
+    """Unique indexes = the DB-level guard against agent retries inserting the
+    same business entity twice (LLM idempotency cannot be trusted). Idempotent;
+    recreated on every backend start since resets drop these collections."""
+    try:
+        _db.promotions.create_index("promo_id", unique=True)
+        _db.promotions.create_index("recommendation_id", unique=True)
+        _db.promotion_recommendations.create_index("recommendation_id", unique=True)
+        _db.purchase_orders.create_index("po_id", unique=True)
+        # Business rule as a DB constraint: at most ONE open (placed) PO per
+        # ingredient — racing agent runs physically cannot double-order.
+        _db.purchase_orders.create_index(
+            "line_items.ingredient_id", unique=True,
+            partialFilterExpression={"status": "placed"},
+            name="one_open_po_per_ingredient",
+        )
+    except Exception as e:  # duplicate legacy data — surface it, don't crash
+        print(f"WARNING: could not create unique indexes: {e}")
+
+
+_ensure_indexes()
 
 app = get_fast_api_app(
     agents_dir=str(_REPO_ROOT),
@@ -73,12 +100,19 @@ def _sim_now() -> str:
 
 
 def _snapshot() -> dict:
+    # notified_count per promo (how many customers Outreach pushed) — the
+    # denominator for predicted-vs-actual uptake on the dashboard.
+    sends = {s["_id"]: s["n"] for s in _db.campaign_sends.aggregate(
+        [{"$group": {"_id": "$promo_id", "n": {"$sum": 1}}}])}
+    promos = list(_db.promotions.find().sort("created_at", -1).limit(5))
+    for p in promos:
+        p["notified_count"] = sends.get(p.get("promo_id"), 0)
     return {
         "live_metrics": _jsonable(_db.live_metrics.find_one({"_id": "current"}) or {}),
         "financials": _jsonable(list(_db.financials.find().sort("period_id", 1))),
         "recommendations": _jsonable(list(
             _db.promotion_recommendations.find().sort("created_at", -1).limit(10))),
-        "promotions": _jsonable(list(_db.promotions.find().sort("created_at", -1).limit(5))),
+        "promotions": _jsonable(promos),
         "purchase_orders": _jsonable(list(
             _db.purchase_orders.find().sort("placed_at", -1).limit(10))),
         "agent_events": _jsonable(list(
@@ -86,8 +120,26 @@ def _snapshot() -> dict:
         "raw_ingredients": _jsonable(list(_db.raw_ingredients.find(
             {}, {"ingredient_id": 1, "name": 1, "unit": 1, "on_hand_qty": 1,
                  "reorder_point": 1, "par_level": 1}).sort("name", 1))),
+        "orders": _jsonable(list(_db.orders.find(
+            {"source": "simulator"},
+            {"order_id": 1, "opened_at": 1, "channel": 1, "guest_count": 1,
+             "net_amount_money": 1, "line_items": 1, "created_at": 1},
+        ).sort("opened_at", -1).limit(5))),
+        "waste_7d_cents": _waste_7d(),
         "sim_now": _sim_now(),
     }
+
+
+def _waste_7d() -> int:
+    """Spoilage cost over the trailing 7 sim-days (waste_events)."""
+    now = _sim_now()
+    cut = (datetime.strptime(now, "%Y-%m-%dT%H:%M:%SZ")
+           - timedelta(days=7)).strftime("%Y-%m-%d")
+    w = list(_db.waste_events.aggregate([
+        {"$match": {"day": {"$gte": cut}}},
+        {"$group": {"_id": None, "c": {"$sum": "$cost_cents"}}},
+    ]))
+    return w[0]["c"] if w else 0
 
 
 @app.get("/api/dashboard")
@@ -146,6 +198,70 @@ def decide(rec_id: str, body: Decision):
                   "decided_at": now, "updated_at": now}},
     )
     return {"recommendation_id": rec_id, "status": body.decision, "decided_at": now}
+
+
+# ── simulator control (the demo knob) ────────────────────────────────────────
+# Lets a (possibly remote) user run one simulated day at a chosen pace. The knob
+# is "how many real minutes should one day take"; we translate that to SIM_SPEED
+# over the ~13h service window (closed hours fast-forward and cost ~0 real time).
+_SERVICE_WINDOW_SIM_SECONDS = 13 * 3600  # 10:00–23:00
+_sim_proc: subprocess.Popen | None = None
+
+
+class SimStart(BaseModel):
+    day_minutes: float = 5
+
+
+@app.post("/api/sim/start")
+def sim_start(body: SimStart):
+    global _sim_proc
+    if _sim_proc and _sim_proc.poll() is None:
+        raise HTTPException(409, "a simulated day is already running")
+    if not 0.5 <= body.day_minutes <= 60:
+        raise HTTPException(422, "day_minutes must be between 0.5 and 60")
+    speed = max(1, round(_SERVICE_WINDOW_SIM_SECONDS / (body.day_minutes * 60)))
+    env = {**os.environ, "SIM_SPEED": str(speed)}
+    _sim_proc = subprocess.Popen(
+        [sys.executable, "-m", "plumbing.simulator"],
+        cwd=str(_REPO_ROOT), env=env,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    # the day about to be simulated = day after the latest order, starting 12 AM
+    day_start = (datetime.strptime(_sim_now(), "%Y-%m-%dT%H:%M:%SZ")
+                 + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
+    return {"running": True, "sim_speed": speed, "day_minutes": body.day_minutes,
+            "sim_day_start": day_start}
+
+
+@app.post("/api/sim/stop")
+def sim_stop():
+    global _sim_proc
+    if _sim_proc and _sim_proc.poll() is None:
+        _sim_proc.terminate()
+    # clear a lingering pause so the next run starts cleanly
+    _db.sim_control.update_one({"_id": "sim"}, {"$set": {"paused": False}}, upsert=True)
+    return {"running": False}
+
+
+@app.post("/api/sim/pause")
+def sim_pause():
+    """Flip the sim_control flag the simulator polls — it holds at the current
+    sim-time until resumed (same mechanism as the CLI --pause)."""
+    _db.sim_control.update_one({"_id": "sim"}, {"$set": {"paused": True}}, upsert=True)
+    return {"paused": True}
+
+
+@app.post("/api/sim/resume")
+def sim_resume():
+    _db.sim_control.update_one({"_id": "sim"}, {"$set": {"paused": False}}, upsert=True)
+    return {"paused": False}
+
+
+@app.get("/api/sim/status")
+def sim_status():
+    ctl = _db.sim_control.find_one({"_id": "sim"}, {"paused": 1}) or {}
+    return {"running": bool(_sim_proc and _sim_proc.poll() is None),
+            "paused": bool(ctl.get("paused"))}
 
 
 # Production build of the SPA, when present (dashboard/dist). Mounted last so

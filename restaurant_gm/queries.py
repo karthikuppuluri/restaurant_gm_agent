@@ -16,6 +16,7 @@ objects ({"amount": cents, "currency": "USD"}) only when writing.
 """
 
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
@@ -85,6 +86,8 @@ def get_sim_now() -> dict:
         "sim_now_plus_2h": _ts(dt + timedelta(hours=2)),
         "sim_now_plus_24h": _ts(dt + timedelta(hours=24)),
         "sim_now_plus_72h": _ts(dt + timedelta(hours=72)),
+        # use verbatim when creating a promotions doc — never invent IDs
+        "suggested_promo_id": f"promo_{uuid.uuid4().hex[:8]}",
     }
 
 
@@ -103,6 +106,14 @@ def stock_snapshot() -> dict:
     lm = db.live_metrics.find_one({"_id": "current"}, {"cash_on_hand_money": 1}) or {}
     cash = lm.get("cash_on_hand_money", {}).get("amount")
 
+    # Spoilage over the trailing 7 sim-days — the recurring cost of overbuying.
+    week_start = _ts(_parse(sim_now) - timedelta(days=7))[:10]
+    waste = {w["_id"]: w for w in db.waste_events.aggregate([
+        {"$match": {"day": {"$gte": week_start}}},
+        {"$group": {"_id": "$ingredient_id", "qty": {"$sum": "$qty"},
+                    "cost": {"$sum": "$cost_cents"}}},
+    ])}
+
     # Open POs (draft/placed) suppress re-ordering of the same ingredient.
     covered = set()
     for po in db.purchase_orders.find(
@@ -116,6 +127,7 @@ def stock_snapshot() -> dict:
         per_hour = usage.get(r["ingredient_id"], 0)
         is_zero = r["on_hand_qty"] <= 0
         needs = r["on_hand_qty"] < r["reorder_point"]
+        w = waste.get(r["ingredient_id"])
         ingredients.append({
             "ingredient_id": r["ingredient_id"], "name": r["name"], "unit": r["unit"],
             "on_hand_qty": r["on_hand_qty"], "reorder_point": r["reorder_point"],
@@ -123,6 +135,8 @@ def stock_snapshot() -> dict:
             "hours_of_cover": round(r["on_hand_qty"] / per_hour, 1) if per_hour else None,
             "needs_reorder": needs, "is_zero": is_zero,
             "has_open_po": r["ingredient_id"] in covered,
+            "waste_7d_qty": round(w["qty"], 2) if w else 0,
+            "waste_7d_cost_cents": w["cost"] if w else 0,
         })
         if is_zero:
             zero_ids.append(r["ingredient_id"])
@@ -133,7 +147,7 @@ def stock_snapshot() -> dict:
         "menu_item_id", {"ingredients.ingredient_id": {"$in": zero_ids}})) if zero_ids else []
 
     suggested = _group_pos(db, [(r, r["par_level"] - r["on_hand_qty"]) for r in to_order],
-                           sim_now) if to_order else []
+                           sim_now, usage=usage) if to_order else []
 
     return {
         "sim_now": sim_now,
@@ -141,6 +155,7 @@ def stock_snapshot() -> dict:
         "ingredients": ingredients,
         "eighty_sixed_item_ids": eighty_sixed,
         "suggested_purchase_orders": suggested,
+        "waste_7d_total_cents": sum(w["cost"] for w in waste.values()),
     }
 
 
@@ -155,11 +170,13 @@ def _delivery_ts(now_dt: datetime, lead_time_days: int) -> str:
     return _ts(d)
 
 
-def _group_pos(db, wants: list, sim_now: str) -> list:
+def _group_pos(db, wants: list, sim_now: str, usage: dict | None = None) -> list:
     """wants: [(raw_ingredient doc, desired_qty)] -> ready-made POs grouped by
     preferred vendor: qty rounded UP to the vendor minimum, line totals,
     total_cents, expected_delivery (morning of the delivery date, longest lead
-    time in the PO)."""
+    time in the PO). When a usage map is given, each line also carries
+    usage_per_hour + cover_after_delivery_hours so the agent can judge whether
+    a slow-moving ingredient is worth reordering at all."""
     vendor_ids = sorted({r["preferred_vendor_id"] for r, _ in wants})
     vendors = {v["vendor_id"]: v for v in db.vendors.find({"vendor_id": {"$in": vendor_ids}})}
     now_dt = _parse(sim_now)
@@ -175,14 +192,25 @@ def _group_pos(db, wants: list, sim_now: str) -> list:
         qty = -(-qty // moq) * moq  # round UP to a multiple of min_order_qty
         unit_cost = supply["unit_cost_money"]["amount"]
         po = pos.setdefault(v["vendor_id"], {
+            # Pre-generated ID: at temperature 0 the model cannot invent random
+            # IDs (it copies examples — we got po_00000001 collisions). It must
+            # use this one verbatim.
+            "po_id": f"po_{uuid.uuid4().hex[:8]}",
             "vendor_id": v["vendor_id"], "vendor_name": v["name"],
             "line_items": [], "total_cents": 0,
             "expected_delivery": _delivery_ts(now_dt, supply["lead_time_days"]),
         })
-        po["line_items"].append({
+        line = {
             "ingredient_id": r["ingredient_id"], "name": r["name"], "qty": int(qty),
             "unit_cost_cents": unit_cost, "line_total_cents": int(qty) * unit_cost,
-        })
+        }
+        if usage is not None:
+            per_hour = usage.get(r["ingredient_id"], 0)
+            line["usage_per_hour"] = per_hour
+            line["cover_after_delivery_hours"] = (
+                round((r.get("on_hand_qty", 0) + int(qty)) / per_hour, 1)
+                if per_hour else None)
+        po["line_items"].append(line)
         po["total_cents"] += int(qty) * unit_cost
         eta = _delivery_ts(now_dt, supply["lead_time_days"])
         if eta > po["expected_delivery"]:
@@ -293,9 +321,11 @@ def sales_snapshot(window_hours: float = 2) -> dict:
 
 def promo_evidence() -> dict:
     """Everything needed to build a promo recommendation in one call: 24h top
-    sellers, per-candidate margins (incl. precomputed margin after 10/15/20/25%
-    discounts), stock cover hours, pricing-rule guardrails, blackout flags, and
-    the opted-in audience size with average price sensitivity."""
+    sellers AND slow movers as candidates, per-candidate margins (incl.
+    precomputed margin after 10/15/20/25% discounts), stock cover hours,
+    pricing-rule guardrails, blackout flags, and a menu of real audience
+    segments (all opted-in, by loyalty tier, deal-seekers, dietary, walk-in
+    share) so targeting can vary with the data."""
     db = _db()
     sim_now = _sim_now(db)
     if not sim_now:
@@ -306,7 +336,7 @@ def promo_evidence() -> dict:
                                            "max_discount_pct": 1, "blackout_item_ids": 1}) or {}
     blackout = set(rules.get("blackout_item_ids", []))
 
-    top = list(db.orders.aggregate([
+    sold = list(db.orders.aggregate([
         {"$match": {"opened_at": {"$gte": start, "$lte": sim_now}}},
         {"$unwind": "$line_items"},
         {"$group": {"_id": "$line_items.item_id",
@@ -314,8 +344,12 @@ def promo_evidence() -> dict:
                     "qty": {"$sum": "$line_items.quantity"},
                     "revenue_cents": {"$sum": "$line_items.gross_money.amount"}}},
         {"$sort": {"revenue_cents": -1}},
-        {"$limit": 5},
     ]))
+    # Candidates = top 5 sellers (push the hot thing) + 3 slow movers (boost the
+    # underdog) — both are legitimate promo plays; billing picks per the evidence.
+    top = sold[:5]
+    top_ids = {c["_id"] for c in top}
+    slow = [c for c in sorted(sold, key=lambda c: c["qty"]) if c["_id"] not in top_ids][:3]
 
     shift = list(db.orders.aggregate([
         {"$match": {"opened_at": {"$gte": start, "$lte": sim_now}}},
@@ -326,18 +360,57 @@ def promo_evidence() -> dict:
     s = shift[0] if shift else {"revenue": 0, "discount": 0, "orders": 0}
 
     usage = _ingredient_usage_per_hour(db, sim_now)
-    stock = {r["ingredient_id"]: r["on_hand_qty"]
-             for r in db.raw_ingredients.find({}, {"ingredient_id": 1, "on_hand_qty": 1})}
-    ing_cost = {r["ingredient_id"]: r["unit_cost_money"]["amount"]
-                for r in db.raw_ingredients.find({}, {"ingredient_id": 1, "unit_cost_money": 1})}
-    item_ids = [c["_id"] for c in top]
+    raw = list(db.raw_ingredients.find({}, {"ingredient_id": 1, "name": 1, "unit": 1,
+                                            "on_hand_qty": 1, "par_level": 1,
+                                            "unit_cost_money": 1}))
+    stock = {r["ingredient_id"]: r["on_hand_qty"] for r in raw}
+    ing_cost = {r["ingredient_id"]: r["unit_cost_money"]["amount"] for r in raw}
+
+    # Surplus: ingredients well above par — overstock is future waste, and a promo
+    # on the items that consume them is the classic restaurant move. Sorted by the
+    # dollar value of the excess.
+    surplus = []
+    for r in raw:
+        if r.get("par_level") and r["on_hand_qty"] > r["par_level"] * 1.2:
+            per_hour = usage.get(r["ingredient_id"], 0)
+            surplus.append({
+                "ingredient_id": r["ingredient_id"], "name": r["name"],
+                "on_hand_qty": r["on_hand_qty"], "par_level": r["par_level"],
+                "hours_of_cover": round(r["on_hand_qty"] / per_hour, 1) if per_hour else None,
+                "excess_value_cents": round((r["on_hand_qty"] - r["par_level"])
+                                            * r["unit_cost_money"]["amount"]),
+                "used_by_item_ids": sorted(db.recipes.distinct(
+                    "menu_item_id", {"ingredients.ingredient_id": r["ingredient_id"]})),
+            })
+    surplus.sort(key=lambda x: -x["excess_value_cents"])
+    surplus = surplus[:5]
+
+    sold_map = {c["_id"]: c for c in sold}
+    pool = [(c["_id"], "top_seller") for c in top] + [(c["_id"], "slow_mover") for c in slow]
+    pool_ids = {i for i, _ in pool}
+    # Items that consume surplus ingredients join the candidate pool too.
+    for s_ing in surplus:
+        for iid in s_ing["used_by_item_ids"]:
+            if iid not in pool_ids and len(pool_ids) < 11:
+                pool.append((iid, "surplus_mover"))
+                pool_ids.add(iid)
+
+    item_ids = [i for i, _ in pool]
     menu = {m["item_id"]: m for m in db.menu_items.find({"item_id": {"$in": item_ids}})}
     recipes = {r["menu_item_id"]: r
                for r in db.recipes.find({"menu_item_id": {"$in": item_ids}})}
 
+    # Fans per candidate item: opted-in customers who list it as a favorite —
+    # the affinity audience for { "favorite_item_ids": [...] } targeting.
+    fans = {f["_id"]: f["n"] for f in db.customers.aggregate([
+        {"$match": {"opt_in_marketing": True}},
+        {"$unwind": "$favorite_item_ids"},
+        {"$group": {"_id": "$favorite_item_ids", "n": {"$sum": 1}}},
+    ])}
+
     candidates = []
-    for c in top:
-        item_id = c["_id"]
+    for item_id, ctype in pool:
+        c = sold_map.get(item_id, {"qty": 0, "revenue_cents": 0})
         m, rec = menu.get(item_id), recipes.get(item_id)
         if not m or not rec:
             continue
@@ -353,32 +426,65 @@ def promo_evidence() -> dict:
                  for i in rec["ingredients"]
                  if usage.get(i["ingredient_id"]) and i["ingredient_id"] in stock]
         candidates.append({
-            "item_id": item_id, "name": c["name"], "qty_24h": c["qty"],
+            "item_id": item_id, "name": m["name"], "candidate_type": ctype,
+            "qty_24h": c["qty"],
             "revenue_24h_cents": c["revenue_cents"], "price_cents": price,
             "food_cost_cents": food_cost, "margin_pct": margin,
             "margin_after_discount_pct": after,
             "stock_cover_hours": round(min(cover), 1) if cover else None,
+            "fans_opted_in": fans.get(item_id, 0),
             "blackout": item_id in blackout,
         })
 
-    aud = list(db.customers.aggregate([
-        {"$match": {"opt_in_marketing": True, "loyalty_tier": {"$in": ["silver", "gold"]}}},
-        {"$group": {"_id": None, "count": {"$sum": 1},
-                    "avg_price_sensitivity": {"$avg": "$price_sensitivity"}}},
-    ]))
-    audience = ({"count": aud[0]["count"],
-                 "avg_price_sensitivity": round(aud[0]["avg_price_sensitivity"], 2)}
-                if aud else {"count": 0, "avg_price_sensitivity": None})
+    seg = list(db.customers.aggregate([{"$facet": {
+        "all_opted_in": [
+            {"$match": {"opt_in_marketing": True}},
+            {"$group": {"_id": None, "count": {"$sum": 1},
+                        "avg_ps": {"$avg": "$price_sensitivity"}}}],
+        "by_loyalty_opted_in": [
+            {"$match": {"opt_in_marketing": True}},
+            {"$group": {"_id": "$loyalty_tier", "count": {"$sum": 1},
+                        "avg_ps": {"$avg": "$price_sensitivity"}}}],
+        "deal_seekers_opted_in": [
+            {"$match": {"opt_in_marketing": True, "price_sensitivity": {"$gte": 0.6}}},
+            {"$group": {"_id": None, "count": {"$sum": 1}}}],
+        "dietary_opted_in": [
+            {"$match": {"opt_in_marketing": True}},
+            {"$unwind": "$dietary_flags"},
+            {"$group": {"_id": "$dietary_flags", "count": {"$sum": 1}}}],
+        "total_customers": [{"$count": "n"}],
+    }}]))[0]
+    a = seg["all_opted_in"][0] if seg["all_opted_in"] else {}
+    audience_segments = {
+        "all_opted_in": {"count": a.get("count", 0),
+                         "avg_price_sensitivity": round(a["avg_ps"], 2)
+                         if a.get("avg_ps") is not None else None},
+        "by_loyalty_opted_in": {
+            s["_id"]: {"count": s["count"], "avg_price_sensitivity": round(s["avg_ps"], 2)}
+            for s in seg["by_loyalty_opted_in"]},
+        "deal_seekers_opted_in_ps_gte_0.6": {
+            "count": seg["deal_seekers_opted_in"][0]["count"]
+            if seg["deal_seekers_opted_in"] else 0},
+        "dietary_opted_in": {s["_id"]: s["count"] for s in seg["dietary_opted_in"]},
+        "total_known_customers": (seg["total_customers"][0]["n"]
+                                  if seg["total_customers"] else 0),
+        "walk_ins": {"share_of_orders_pct": 40,
+                     "note": "walk-ins have no profile — only a promo with EMPTY "
+                             "target_criteria ({}) reaches them"},
+    }
 
     return {
         "sim_now": sim_now,
+        # use verbatim when inserting the recommendation — never invent IDs
+        "suggested_recommendation_id": f"rec_{uuid.uuid4().hex[:8]}",
         "shift_24h": {"revenue_cents": s["revenue"], "discount_cents": s["discount"],
                       "order_count": s["orders"]},
         "candidates": candidates,
         "pricing_rules": {"min_margin_pct": rules.get("min_margin_pct"),
                           "max_discount_pct": rules.get("max_discount_pct"),
                           "blackout_item_ids": sorted(blackout)},
-        "audience_opted_in_silver_gold": audience,
+        "audience_segments": audience_segments,
+        "surplus_ingredients": surplus,
     }
 
 
@@ -403,6 +509,8 @@ def promo_audience(promo_id: str = "") -> dict:
         match["city"] = criteria["city"]
     if "dietary_flags" in criteria:
         match["dietary_flags"] = {"$in": criteria["dietary_flags"]}
+    if "favorite_item_ids" in criteria:
+        match["favorite_item_ids"] = {"$in": criteria["favorite_item_ids"]}
     customer_ids = sorted(db.customers.distinct("customer_id", match))
 
     return {

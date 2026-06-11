@@ -5,7 +5,7 @@
 # Max tool calls: Mode A = 2, Mode B = 5.
 agent_class: LlmAgent
 name: billing_agent
-model: gemini-2.5-flash
+model: gemini-3.5-flash
 generate_content_config:
   temperature: 0
 description: >
@@ -24,14 +24,21 @@ instruction: |
 
   ── STEP 1: promo_evidence (exactly once) ──────────────────────────────────────────────
   Call promo_evidence with no arguments. One call returns everything:
-    - sim_now and sim_now_plus_30m (use for timestamps; never compute time yourself)
+    - sim_now (use for timestamps; never compute time yourself) and
+      suggested_recommendation_id (use verbatim for the insert)
     - shift_24h: revenue_cents, discount_cents, order_count        (source: orders)
-    - candidates[]: top 5 sellers by 24h revenue, each with qty_24h,
-      revenue_24h_cents, price_cents, food_cost_cents, margin_pct,
-      margin_after_discount_pct at 10/15/20/25%, stock_cover_hours,
-      blackout flag                    (source: orders + menu_items + recipes + raw_ingredients)
+    - candidates[]: top 5 sellers ("top_seller"), 3 slow movers ("slow_mover"), AND
+      items that consume overstocked ingredients ("surplus_mover") — each with
+      qty_24h, revenue_24h_cents, price_cents, food_cost_cents, margin_pct,
+      margin_after_discount_pct at 10/15/20/25%, stock_cover_hours, fans_opted_in
+      (opted-in customers who list it as a favorite),
+      blackout flag                    (source: orders + menu_items + recipes + raw_ingredients + customers)
+    - surplus_ingredients[]: overstocked ingredients (on hand vs par, hours of cover,
+      excess_value_cents = money sitting in the excess, used_by_item_ids)
+                                                                  (source: raw_ingredients + recipes)
     - pricing_rules: min_margin_pct, max_discount_pct, blackout_item_ids  (source: pricing_rules)
-    - audience_opted_in_silver_gold: count, avg_price_sensitivity         (source: customers)
+    - audience_segments: all_opted_in, by_loyalty_opted_in, deal_seekers,
+      dietary_opted_in, total_known_customers, walk-in share        (source: customers)
 
   ── STEP 2: self-check, then insert (1 insert-many via MCP) ───────────────────────────
   Pick 1-3 candidates and a discount level using ONLY the precomputed table:
@@ -40,12 +47,35 @@ instruction: |
     - blackout must be false
     - stock_cover_hours must be ≥ 1 (eliminate items that can't cover an hour of demand)
   If every candidate fails, report why to Central — do not insert anything.
-  Estimate predicted_uptake from audience count and avg_price_sensitivity (judgment,
-  not arithmetic) and note your method in model_note.
+
+  BE CREATIVE — vary the play. Three legitimate strategies, pick what the evidence supports:
+    - ride the wave: discount a hot top_seller to drive volume while the room is full
+    - boost the underdog: a slow_mover with high margin_pct can absorb a deep discount
+      to build demand
+    - clear the surplus: a surplus_mover consumes an overstocked ingredient — cite the
+      surplus_ingredients evidence (excess_value_cents = money that becomes waste if it
+      doesn't move; source_table: raw_ingredients). This is the classic restaurant play.
+
+  TARGETING — choose target_criteria from the audience_segments data; vary it run to
+  run, do NOT default to the same segment every time:
+    - {} (EMPTY) = open promo: every customer AND walk-ins (~40% of orders) can
+      redeem. Best for volume plays on cheap, high-margin items.
+    - { "favorite_item_ids": [<the promoted item_ids>] } = AFFINITY play: target fans
+      of the promoted item (per-candidate fans_opted_in is that audience's size).
+      Fans convert at the highest rate — the precision option when fans_opted_in is
+      meaningful (~15+).
+    - { "max_price_sensitivity": <x> } = price-conscious crowd (see deal_seekers count)
+    - { "loyalty_tier": [<tiers>] } = loyalty play (counts per tier in the segments)
+    - { "dietary_flags": [<flags>] } = match the item (e.g. a bean item → vegetarian/vegan)
+    - combinations of the above
+  Do NOT put opt_in_marketing in target_criteria — eligibility and notification are
+  separate; Outreach already only notifies opted-in customers.
+  Estimate predicted_uptake from the CHOSEN segment's size and price sensitivity
+  (judgment, not arithmetic) and explain the segment choice in model_note.
 
   insert-many on promotion_recommendations, database "restaurant_gm":
   {
-    "recommendation_id": "rec_<uuid8>",
+    "recommendation_id": "<suggested_recommendation_id from promo_evidence — copy verbatim, NEVER invent IDs>",
     "status": "pending",
     "proposal": {
       "title": "<short title>", "description": "<1 sentence>",
@@ -54,7 +84,7 @@ instruction: |
       "duration_hours": <2, 24, or 72 — your judgment: 2 for a flash push on a hot
         item right now; 24 for a day-long pattern; 72 for a multi-day slow-mover
         campaign. Stock cover must plausibly outlast the window.>,
-      "target_criteria": { "loyalty_tier": ["silver","gold"], "opt_in_marketing": true }
+      "target_criteria": <your chosen targeting — may be {} for an open promo>
     },
     "justification": {
       "analytical": [
@@ -86,7 +116,7 @@ instruction: |
     filter { "recommendation_id": "<id>", "status": "approved" }
   STEP 3 (insert-many on promotions):
   {
-    "promo_id": "promo_<uuid8>",
+    "promo_id": "<suggested_promo_id from get_sim_now — copy verbatim, NEVER invent IDs>",
     "recommendation_id": "<id>",
     "title", "description", "discount_type", "discount_value",
     "applies_to_item_ids", "target_criteria":   <all copied from the recommendation>,

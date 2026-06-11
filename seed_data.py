@@ -10,6 +10,7 @@ pricing_rules, customers (150), orders (~600 over 14 days).
 Insert order is dependency-safe: raw_ingredients → recipes → menu_items.
 """
 
+import math
 import os
 import random
 from datetime import datetime, timedelta, timezone
@@ -388,6 +389,25 @@ RAW_INGREDIENTS = [
         **audit(),
     },
 ]
+
+# Shelf life (days) per ingredient — drives the simulator's daily spoilage pass:
+# stock beyond what current demand can consume within its shelf life gets tossed
+# (logged to waste_events), so dead stock produces a real, recurring cost signal
+# the Inventory agent can act on. Fresh produce/dairy short; dry goods long.
+_SHELF_LIFE_DAYS = {
+    "ing_tortilla_chips": 21, "ing_guacamole": 2, "ing_salsa": 5,
+    "ing_shredded_lettuce": 3, "ing_tomato_diced": 3, "ing_pico_de_gallo": 2,
+    "ing_jalapenos": 10, "ing_seasoned_beef": 4, "ing_grilled_chicken": 4,
+    "ing_taco_shell": 30, "ing_flour_tortilla_sm": 7, "ing_flour_tortilla_lg": 7,
+    "ing_chalupa_shell": 30, "ing_tostada_shell": 30, "ing_nacho_cheese": 7,
+    "ing_shredded_cheese": 10, "ing_sour_cream": 7, "ing_jalapeno_sauce": 14,
+    "ing_chocolate_sauce": 30, "ing_black_beans": 5, "ing_mexican_rice": 3,
+    "ing_soda_syrup": 90, "ing_horchata_mix": 60, "ing_agua_fresca_mix": 60,
+    "ing_iced_tea_conc": 30, "ing_cup_large": 365, "ing_cinnamon_twists": 14,
+    "ing_churros": 5,
+}
+for _r in RAW_INGREDIENTS:
+    _r["shelf_life_days"] = _SHELF_LIFE_DAYS[_r["ingredient_id"]]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1070,13 +1090,36 @@ CUSTOMERS = _generate_customers()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ORDERS  (~600 historical orders, 14 days, no promos)
-# Spread across 2026-05-26 → 2026-06-08. Arrival times follow a lunch/dinner
-# distribution (same shape as the simulator) so the order-mgmt agent has
-# a meaningful baseline to compare against. ~40 orders/weekday, ~50/weekend.
+# ORDERS  (~880 historical orders, 14 days, no promos)
+# Spread across 2026-05-26 → 2026-06-08, generated with the SAME statistical
+# model as the live simulator (Poisson arrivals on the same hourly-rate curve,
+# same low-skewed quantities, same customer-favorites bias) so the baseline is
+# calibrated: live sim days differ from history only through promos/stockouts,
+# never through a different generative model. Keep these constants in sync with
+# plumbing/simulator.py.
 # Totals use integer BPS arithmetic to stay in sync with pricing_rules.
 # ──────────────────────────────────────────────────────────────────────────────
 _TAX_BPS = 875  # mirrors pricing_rules.tax_rate_bps
+
+# keep in sync with plumbing/simulator.py HOURLY_RATE
+_HOURLY_RATE = {
+    10: 1, 11: 4, 12: 8, 13: 6, 14: 2, 15: 1,
+    16: 2, 17: 5, 18: 9, 19: 12, 20: 8, 21: 4, 22: 1,
+}
+# keep in sync with the simulator's quantity skew
+_QTY_POOL, _QTY_WEIGHTS = [1, 2, 3, 4, 5, 6], [45, 28, 14, 7, 4, 2]
+
+
+def _poisson(lam: float) -> int:
+    """Knuth algorithm — keep in sync with plumbing/simulator.py."""
+    if lam <= 0:
+        return 0
+    L = math.exp(-lam)
+    k, p = 0, 1.0
+    while p > L:
+        k += 1
+        p *= random.random()
+    return k - 1
 
 _ITEM_WEIGHTS = {
     "cat_item_crunchy_taco_01":      15,
@@ -1106,40 +1149,46 @@ _ITEM_CUM_WEIGHTS = list(_ITEM_WEIGHTS.values())
 _PRICE_MAP = {m["item_id"]: m["price_money"]["amount"] for m in MENU_ITEMS}
 _NAME_MAP  = {m["item_id"]: m["name"]                  for m in MENU_ITEMS}
 
-# Hour-of-day weights for realistic arrival distribution (lunch + dinner peaks).
-# Matches the simulator's HOURLY_RATE shape so the baseline is comparable.
-_HOUR_POOL    = list(range(10, 23))
-_HOUR_WEIGHTS = [1, 4, 8, 6, 2, 1, 2, 5, 9, 12, 8, 4, 1]  # hours 10-22
-
 
 def _generate_orders():
     random.seed(SEED + 2)
-    cust_ids = [c["customer_id"] for c in CUSTOMERS]
+    customers_by_id = {c["customer_id"]: c for c in CUSTOMERS}
+    cust_ids = list(customers_by_id)
     base = datetime(2026, 5, 26, tzinfo=timezone.utc)
     orders = []
     order_counter = 1
 
     for day_offset in range(14):
         day = base + timedelta(days=day_offset)
-        is_weekend = day.weekday() >= 5
-        n_orders = random.randint(45, 55) if is_weekend else random.randint(37, 45)
+        # Same arrival process as the live simulator: Poisson per minute on the
+        # shared hourly-rate curve (≈63 expected orders/day).
+        arrivals = []
+        for hour, rate in _HOURLY_RATE.items():
+            for minute in range(60):
+                for _ in range(_poisson(rate / 60)):
+                    arrivals.append(day.replace(hour=hour, minute=minute,
+                                                second=random.randint(0, 59)))
+        arrivals.sort()
 
-        for _ in range(n_orders):
-            hour   = random.choices(_HOUR_POOL, weights=_HOUR_WEIGHTS)[0]
-            minute = random.randint(0, 59)
-            second = random.randint(0, 59)
-            opened = day.replace(hour=hour, minute=minute, second=second)
-
+        for opened in arrivals:
             channel = random.choices(["DINE_IN", "TAKEOUT"], weights=[60, 40])[0]
             guest_count = random.randint(1, 6) if channel == "DINE_IN" else 1
             customer_id = random.choice(cust_ids) if random.random() < 0.60 else None
 
+            # Same taste model as the simulator: popularity weights, with a
+            # known customer ~3x as likely to pick their favorite items.
+            weights = list(_ITEM_CUM_WEIGHTS)
+            if customer_id:
+                favs = set(customers_by_id[customer_id].get("favorite_item_ids", []))
+                weights = [w * 3 if item in favs else w
+                           for item, w in zip(_ITEM_POOL, weights)]
+
             n_items = random.randint(1, 4)
-            chosen_items = random.choices(_ITEM_POOL, weights=_ITEM_CUM_WEIGHTS, k=n_items)
+            chosen_items = random.choices(_ITEM_POOL, weights=weights, k=n_items)
             line_items = []
             total_gross = 0
             for j, item_id in enumerate(chosen_items):
-                qty = random.randint(1, 6)
+                qty = random.choices(_QTY_POOL, weights=_QTY_WEIGHTS)[0]
                 price = _PRICE_MAP[item_id]
                 gross = price * qty
                 total_gross += gross
@@ -1189,6 +1238,65 @@ def _generate_orders():
 
 
 ORDERS = _generate_orders()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# EQUILIBRIUM TUNING — self-calibrating stock levels.
+# The seed just generated its own demand, so it can size perishable stock to
+# match: an ingredient whose par_level exceeds what demand consumes within its
+# shelf life starts the sim on a spoilage treadmill (every top-up-to-par bleeds
+# waste). For those, pull par/reorder/on_hand down to demand-justified levels.
+# Waste then only appears when someone genuinely overbuys — which is the signal
+# the Inventory agent is meant to react to, not background noise.
+# ──────────────────────────────────────────────────────────────────────────────
+def _tune_stock_levels() -> None:
+    bom = {}
+    for rec in RECIPES:
+        y = rec.get("yield_qty", 1) or 1
+        bom[rec["menu_item_id"]] = [(i["ingredient_id"], i["qty"] / y)
+                                    for i in rec["ingredients"]]
+    usage = {}
+    for o in ORDERS:
+        for li in o["line_items"]:
+            for ing_id, per_serv in bom.get(li["item_id"], []):
+                usage[ing_id] = usage.get(ing_id, 0) + li["quantity"] * per_serv
+    n_days = 14
+    by_id = {r["ingredient_id"]: r for r in RAW_INGREDIENTS}
+
+    def rnd(r, x):  # whole units for "each"/"slice", 1 decimal otherwise
+        return max(int(round(x)), 1) if r["unit"] in ("each", "slice") else max(round(x, 1), 0.1)
+
+    def max_fresh(r):  # most fresh stock demand can consume within shelf life
+        return (usage.get(r["ingredient_id"], 0) / n_days) * r["shelf_life_days"]
+
+    # 1. Vendor case sizes: a perishable's min_order_qty must not exceed what
+    #    demand can consume within shelf life, or every reorder force-overbuys
+    #    straight onto the spoilage treadmill. Fresh vendors sell smaller cases.
+    for v in VENDORS:
+        for s in v["supplies"]:
+            r = by_id.get(s["ingredient_id"])
+            if not r:
+                continue
+            mf = max_fresh(r)
+            if mf > 0 and s["min_order_qty"] > mf * 0.8:
+                s["min_order_qty"] = rnd(r, mf * 0.5)
+
+    # 2. Stock levels for perishables whose authored par exceeds the ceiling.
+    for r in RAW_INGREDIENTS:
+        u = usage.get(r["ingredient_id"], 0) / n_days
+        mf = max_fresh(r)
+        if u <= 0 or r["par_level"] <= mf:
+            continue  # dry goods / already-balanced — leave authored values
+        moq = max((s["min_order_qty"] for v in VENDORS for s in v["supplies"]
+                   if s["ingredient_id"] == r["ingredient_id"]), default=0)
+        par = max(rnd(r, mf * 0.8), moq)               # headroom, but orderable
+        reorder = rnd(r, min(u * 1.5, par * 0.6))      # ~1.5 days cover, below par
+        r["par_level"] = par
+        r["reorder_point"] = min(reorder, rnd(r, par * 0.6))
+        r["on_hand_qty"] = rnd(r, par * 0.9)           # start healthy, near par
+
+
+_tune_stock_levels()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
