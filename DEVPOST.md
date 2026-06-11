@@ -90,6 +90,6 @@ google-agent-development-kit · gemini-3.5-flash · vertex-ai · mongodb-atlas �
 mongodb-change-streams · mongodb-mcp-server · cloud-run · fastapi · react · python
 
 ## Links
-- Hosted URL: <CLOUD RUN URL>
+- Hosted URL: https://restaurant-gm-app-827886453598.us-central1.run.app
 - Repo: https://github.com/karthikuppuluri/restaurant_gm_agent
 - Video: <YOUTUBE/LOOM LINK>
