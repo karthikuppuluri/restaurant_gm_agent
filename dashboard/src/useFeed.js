@@ -31,6 +31,14 @@ export function useFeed() {
     setState((s) => ({ ...s, sim_now: ts }))
   }
 
+  // The clock only moves FORWARD: after ▶ snaps to the new day's midnight,
+  // stale as_of values riding on unrelated change events must not revert it.
+  // (RFC3339 strings compare lexicographically.)
+  function laterTs(cur, incoming) {
+    if (!incoming) return cur
+    return !cur || incoming > cur ? incoming : cur
+  }
+
   useEffect(() => {
     let stopped = false
 
@@ -50,7 +58,8 @@ export function useFeed() {
           const notifications = notify(s.notifications, collection, operation, doc)
           switch (collection) {
             case 'live_metrics':
-              return { ...s, notifications, live_metrics: doc, sim_now: doc.as_of || s.sim_now }
+              return { ...s, notifications, live_metrics: doc,
+                       sim_now: laterTs(s.sim_now, doc.as_of) }
             case 'financials':
               return { ...s, notifications, financials: upsert(s.financials, doc, '_id', 'asc') }
             case 'promotion_recommendations':
@@ -76,7 +85,7 @@ export function useFeed() {
               return {
                 ...s, notifications,
                 orders: upsert(s.orders, doc, 'order_id').slice(0, 5),
-                sim_now: doc.opened_at || s.sim_now,
+                sim_now: laterTs(s.sim_now, doc.opened_at),
               }
             case 'waste_events':
               if (operation !== 'insert') return s
@@ -112,8 +121,8 @@ export function useFeed() {
   return { ...state, dismiss, setSimNow }
 }
 
-// Turns agent-driven writes into human-readable toasts. Rapid campaign_sends
-// inserts for the same promo merge into one counting toast instead of 50.
+// Turns agent-driven writes into tagged ledger-entry toasts. Rapid
+// campaign_sends inserts for the same promo merge into one counting toast.
 function notify(notifications, collection, operation, doc) {
   const id = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
   let n = null
@@ -121,36 +130,40 @@ function notify(notifications, collection, operation, doc) {
   if (collection === 'purchase_orders' && operation === 'insert') {
     const items = doc.line_items?.length || 0
     n = {
-      id, icon: '📦',
-      text: `Inventory agent ordered ${items} ingredient${items === 1 ? '' : 's'} from ` +
+      id, tag: 'Inventory', tone: '',
+      text: `Ordered ${items} ingredient${items === 1 ? '' : 's'} from ` +
         `${vendorName(doc.vendor_id)} — ${fmtMoney(doc.total_money)}, eta ${doc.expected_delivery?.slice(5, 10) || '?'}`,
     }
   } else if (collection === 'purchase_orders' && operation === 'update' && doc.status === 'received') {
-    n = { id, icon: '🚚', text: `Delivery received from ${vendorName(doc.vendor_id)}` }
+    n = { id, tag: 'Delivery', tone: 'good',
+          text: `Received from ${vendorName(doc.vendor_id)}` }
   } else if (collection === 'promotion_recommendations' && operation === 'insert') {
-    n = { id, icon: '💡', text: `Billing agent proposed “${doc.proposal?.title}” — awaiting your approval` }
+    n = { id, tag: 'Proposal', tone: 'accent',
+          text: `“${doc.proposal?.title}” — awaiting your approval` }
   } else if (collection === 'promotions' && operation === 'insert') {
-    n = { id, icon: '🎉', text: `Promo live: “${doc.title}” (${doc.discount_value}% off)` }
+    n = { id, tag: 'Promo live', tone: 'accent',
+          text: `“${doc.title}” — ${doc.discount_value}% off` }
   } else if (collection === 'waste_events' && operation === 'insert') {
-    n = { id, icon: '🗑', text: `Tossed ${doc.qty} ${doc.unit} of ${doc.name} — ` +
+    n = { id, tag: 'Waste', tone: 'warn',
+          text: `Tossed ${doc.qty} ${doc.unit} of ${doc.name} — ` +
           `${fmtMoney(doc.cost_cents)} past shelf life` }
   } else if (collection === 'agent_events' && operation === 'insert') {
     // phase "started" = instant heads-up the moment a trigger fires
-    n = { id, icon: doc.phase === 'started' ? '⚙️' : '🤖',
-          text: doc.phase === 'started' ? doc.summary
-            : `${doc.agent} agent: ${doc.summary}` }
+    n = { id, tag: doc.phase === 'started' ? 'Working' : `${doc.agent} agent`,
+          tone: doc.phase === 'started' ? 'accent' : '',
+          text: doc.summary }
   } else if (collection === 'agent_events' && operation === 'update' && doc.phase === 'done') {
     // phase "done" = the agent's own words once the run completes
-    n = { id, icon: '🤖', text: `${doc.agent} agent: ${doc.summary}` }
+    n = { id, tag: `${doc.agent} agent`, tone: '', text: doc.summary }
   } else if (collection === 'campaign_sends' && operation === 'insert') {
     const last = notifications[notifications.length - 1]
     if (last?.kind === 'sends' && last.promo_id === doc.promo_id) {
       const count = last.count + 1
       return [...notifications.slice(0, -1),
-        { ...last, count, text: `Outreach notified ${count} customers` }]
+        { ...last, count, text: `Notified ${count} customers` }]
     }
-    n = { id, kind: 'sends', promo_id: doc.promo_id, count: 1, icon: '📣',
-          text: 'Outreach notified 1 customer' }
+    n = { id, kind: 'sends', promo_id: doc.promo_id, count: 1,
+          tag: 'Outreach', tone: '', text: 'Notified 1 customer' }
   }
 
   return n ? [...notifications.slice(-7), n] : notifications

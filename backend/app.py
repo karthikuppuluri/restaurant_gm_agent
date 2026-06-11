@@ -104,7 +104,7 @@ def _snapshot() -> dict:
     # denominator for predicted-vs-actual uptake on the dashboard.
     sends = {s["_id"]: s["n"] for s in _db.campaign_sends.aggregate(
         [{"$group": {"_id": "$promo_id", "n": {"$sum": 1}}}])}
-    promos = list(_db.promotions.find().sort("created_at", -1).limit(5))
+    promos = list(_db.promotions.find().sort("created_at", -1).limit(10))
     for p in promos:
         p["notified_count"] = sends.get(p.get("promo_id"), 0)
     return {
@@ -262,6 +262,131 @@ def sim_status():
     ctl = _db.sim_control.find_one({"_id": "sim"}, {"paused": 1}) or {}
     return {"running": bool(_sim_proc and _sim_proc.poll() is None),
             "paused": bool(ctl.get("paused"))}
+
+
+def _promo_insights(promo_id: str) -> dict:
+    """Deterministic promo post-mortem data (driver, no LLM): conversion of
+    notified customers, actual vs predicted uptake, redeemer demographics, and
+    demand lift on the promoted items during the window vs the window before."""
+    promo = _db.promotions.find_one({"promo_id": promo_id})
+    if not promo:
+        raise HTTPException(404, f"promotion {promo_id} not found")
+
+    notified = _db.campaign_sends.count_documents({"promo_id": promo_id})
+    notified_redeemed = _db.campaign_sends.count_documents(
+        {"promo_id": promo_id, "redeemed": True})
+    total_redemptions = promo.get("redemption_count", 0)
+
+    # redeeming orders: known customers + walk-ins
+    redeemer_ids = [c for c in _db.orders.distinct(
+        "customer_id", {"line_items.promo_id": promo_id}) if c]
+    walk_in_redemptions = _db.orders.count_documents(
+        {"line_items.promo_id": promo_id, "customer_id": None})
+
+    # demographics of known redeemers
+    demo = {"loyalty_tiers": {}, "age_bands": {}, "cities": {},
+            "avg_price_sensitivity": None}
+    if redeemer_ids:
+        custs = list(_db.customers.find({"customer_id": {"$in": redeemer_ids}},
+                                        {"loyalty_tier": 1, "age": 1, "city": 1,
+                                         "price_sensitivity": 1}))
+        ps = []
+        for c in custs:
+            demo["loyalty_tiers"][c.get("loyalty_tier", "none")] = \
+                demo["loyalty_tiers"].get(c.get("loyalty_tier", "none"), 0) + 1
+            age = c.get("age") or 0
+            band = ("18-25" if age <= 25 else "26-35" if age <= 35
+                    else "36-50" if age <= 50 else "50+")
+            demo["age_bands"][band] = demo["age_bands"].get(band, 0) + 1
+            demo["cities"][c.get("city", "?")] = demo["cities"].get(c.get("city", "?"), 0) + 1
+            if c.get("price_sensitivity") is not None:
+                ps.append(c["price_sensitivity"])
+        if ps:
+            demo["avg_price_sensitivity"] = round(sum(ps) / len(ps), 2)
+
+    # demand lift: promoted-item units during the window vs equal window before
+    vf, vu = promo.get("valid_from"), promo.get("valid_until")
+    lift = None
+    if vf and vu:
+        f = datetime.strptime(vf, "%Y-%m-%dT%H:%M:%SZ")
+        u = datetime.strptime(vu, "%Y-%m-%dT%H:%M:%SZ")
+        before_start = (f - (u - f)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        item_ids = promo.get("applies_to_item_ids", [])
+
+        def units(start, end):
+            r = list(_db.orders.aggregate([
+                {"$match": {"opened_at": {"$gte": start, "$lt": end}}},
+                {"$unwind": "$line_items"},
+                {"$match": {"line_items.item_id": {"$in": item_ids}}},
+                {"$group": {"_id": None, "qty": {"$sum": "$line_items.quantity"}}},
+            ]))
+            return r[0]["qty"] if r else 0
+
+        during, before = units(vf, vu), units(before_start, vf)
+        lift = {"units_during": during, "units_before": before,
+                "lift_pct": round((during - before) / before * 100, 1) if before else None}
+
+    discount_given = list(_db.orders.aggregate([
+        {"$match": {"line_items.promo_id": promo_id}},
+        {"$unwind": "$line_items"},
+        {"$match": {"line_items.promo_id": promo_id}},
+        {"$group": {"_id": None,
+                    "discount_cents": {"$sum": "$line_items.applied_discount_money.amount"},
+                    "revenue_cents": {"$sum": "$line_items.gross_money.amount"}}},
+    ]))
+    money = discount_given[0] if discount_given else {"discount_cents": 0, "revenue_cents": 0}
+
+    return {
+        "promo": _jsonable({k: promo.get(k) for k in (
+            "promo_id", "title", "discount_value", "status", "valid_from",
+            "valid_until", "predicted_uptake", "target_criteria",
+            "applies_to_item_ids")}),
+        "notified": notified,
+        "notified_redeemed": notified_redeemed,
+        "conversion_of_notified_pct": round(notified_redeemed / notified * 100, 1)
+        if notified else None,
+        "total_redemptions": total_redemptions,
+        "walk_in_redemptions": walk_in_redemptions,
+        "predicted_uptake_pct": round(promo.get("predicted_uptake", 0) * 100, 1)
+        if promo.get("predicted_uptake") is not None else None,
+        "actual_uptake_pct": round(total_redemptions / notified * 100, 1)
+        if notified else None,
+        "redeemer_demographics": demo,
+        "demand_lift": lift,
+        "promo_line_revenue_cents": money["revenue_cents"],
+        "discount_given_cents": money["discount_cents"],
+    }
+
+
+@app.get("/api/promos/{promo_id}/insights")
+def promo_insights(promo_id: str):
+    return _promo_insights(promo_id)
+
+
+@app.post("/api/promos/{promo_id}/analyze")
+def promo_analyze(promo_id: str):
+    """✨ Agentic retro: a Gemini post-mortem grounded EXCLUSIVELY in the
+    deterministic insights above — did it work, why, what to do differently."""
+    insights = _promo_insights(promo_id)
+    try:
+        from google import genai
+        client = genai.Client()
+        r = client.models.generate_content(
+            model="gemini-3.5-flash",
+            contents=(
+                "You are the promotions analyst for an independent restaurant. "
+                "Here is the complete measured data for a finished promotion, as JSON:\n"
+                f"{json.dumps(insights)}\n\n"
+                "Write a sharp post-mortem in markdown (max ~150 words): "
+                "1) Verdict — success, partial, or flop, with the one number that "
+                "decides it; 2) WHY — compare actual vs predicted uptake, conversion "
+                "of notified customers, walk-in share, and demand lift; 3) Who "
+                "actually redeemed (demographics); 4) One concrete change for the "
+                "next promo. Use ONLY the numbers provided — never invent any."),
+        )
+        return {"analysis": r.text or "", "insights": insights}
+    except Exception as e:
+        raise HTTPException(502, f"analysis failed: {str(e)[:200]}")
 
 
 @app.get("/api/debug/llm")

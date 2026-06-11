@@ -4,6 +4,26 @@ import Md from './Markdown.jsx'
 const APP = 'restaurant_gm'
 const USER = 'gm'
 
+// Consecutive tool-call/transfer lines collapse into one "show thinking" block
+// (LLM-chat style). The trailing group pulses "thinking…" while it's the last
+// thing happening; finished groups collapse to an expandable step count.
+function groupItems(items) {
+  const out = []
+  for (const it of items) {
+    if (it.kind === 'activity') {
+      const last = out[out.length - 1]
+      if (last?.kind === 'thinking') last.steps.push(it.text)
+      else out.push({ kind: 'thinking', steps: [it.text] })
+    } else {
+      out.push(it)
+    }
+  }
+  // only the final group is "live" — and only if no agent answer follows it
+  const last = out[out.length - 1]
+  if (last?.kind === 'thinking') last.live = true
+  return out
+}
+
 // Chat panel: talks to Central through ADK's /run_sse. Tool calls and agent
 // transfers are surfaced as small activity lines (transparency is the product).
 export default function Chat() {
@@ -127,18 +147,43 @@ export default function Chat() {
             “should we run a promo?”
           </div>
         )}
-        {items.map((it, i) =>
-          it.kind === 'activity' ? (
-            <div key={i} className="chat-activity">{it.text}</div>
+        {(() => {
+          const groups = groupItems(items)
+          const last = groups[groups.length - 1]
+          // visible from the instant of Send until real activity/text arrives
+          const showSolo = busy &&
+            !(last?.kind === 'thinking') &&
+            !(last?.kind === 'agent' && !last.done)
+          return (
+            <>
+              {groups.map((g, i) =>
+          g.kind === 'thinking' ? (
+            <details key={i} className="thinking">
+              <summary className={g.live ? 'thinking-live' : ''}>
+                {g.live ? 'thinking' : `show thinking (${g.steps.length} steps)`}
+                {g.live && '…'}
+              </summary>
+              {g.steps.map((t, j) => (
+                <div key={j} className="chat-activity">{t}</div>
+              ))}
+            </details>
           ) : (
-            <div key={i} className={`bubble ${it.kind}`}>
-              {it.kind === 'agent' && <div className="bubble-author">{it.author}</div>}
+            <div key={i} className={`bubble ${g.kind}`}>
+              {g.kind === 'agent' && <div className="bubble-author">{g.author}</div>}
               <div className="bubble-text">
-                {it.kind === 'agent' ? <Md text={it.text} /> : it.text}
+                {g.kind === 'agent' ? <Md text={g.text} /> : g.text}
               </div>
             </div>
           )
-        )}
+              )}
+              {showSolo && (
+                <div className="thinking">
+                  <span className="thinking-live">thinking…</span>
+                </div>
+              )}
+            </>
+          )
+        })()}
       </div>
       <div className="chat-input">
         <input

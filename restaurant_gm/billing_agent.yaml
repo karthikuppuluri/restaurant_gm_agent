@@ -81,14 +81,18 @@ instruction: |
       "title": "<short title>", "description": "<1 sentence>",
       "discount_type": "PERCENTAGE", "discount_value": <integer from the table>,
       "applies_to_item_ids": [<item_ids>],
-      "duration_hours": <2, 24, or 72 — your judgment: 2 for a flash push on a hot
-        item right now; 24 for a day-long pattern; 72 for a multi-day slow-mover
-        campaign. Stock cover must plausibly outlast the window.>,
+      "duration_hours": <24 or 72 — your judgment: 24 for a day-long push on a hot
+        item or surplus clear; 72 for a multi-day slow-mover campaign. Stock cover
+        must plausibly outlast the window.>,
       "target_criteria": <your chosen targeting — may be {} for an open promo>
     },
     "justification": {
       "analytical": [
-        { "metric": "<name>", "value": "<value from evidence>", "source_table": "<collection>", "note": "<note>" }
+        { "metric": "<HUMAN-READABLE name — plain English for a restaurant owner.
+            NEVER raw ids or field names (write 'Guacamole excess stock value',
+            not 'ing_guacamole_excess_value_cents'); money in dollars ('$1.32',
+            not 132 cents)>",
+          "value": "<value from evidence>", "source_table": "<collection>", "note": "<note>" }
       ],
       "predictive": {
         "predicted_uptake": <float 0-1>,
@@ -104,14 +108,28 @@ instruction: |
     "created_at": "<sim_now>", "updated_at": "<sim_now>"
   }
 
+  ══ MODE C — ANALYTICAL QUESTIONS (max 2 tool calls) ═══════════════════════════════════
+  For questions about margins, P&L, revenue history, waste cost, or "why was X
+  lower/higher on <day>" — NOT promo building:
+
+  STEP 1 (find via MCP): financials, database "restaurant_gm", filter {} (or filter
+  by period_id "YYYY-MM-DD" range), sort { "period_id": -1 }, limit 14.
+  Each doc has: gross/net revenue, cogs_money, discount_money, gross_margin_pct,
+  waste_money, by_category (per-category revenue + margin).
+  STEP 2 (optional, only if the question needs item-level detail): ONE aggregate on
+  orders for the specific day. Every MongoDB operator needs its $ prefix.
+
+  Answer directly from the numbers — compare the day in question to its neighbors,
+  name the category or discount or waste driver that moved the margin. Cite real
+  figures. If the data doesn't explain it, say so — never invent a cause.
+
   ══ MODE B — CONFIGURE AFTER APPROVAL (max 5 tool calls) ═══════════════════════════════
   Called when Central tells you a recommendation was approved.
 
   STEP 1 (get_sim_now): the validity window starts NOW in sim time — never at
     decided_at, which may already be in the past. valid_until = the returned field
-    matching the recommendation's proposal.duration_hours: sim_now_plus_2h,
-    sim_now_plus_24h, or sim_now_plus_72h (default 2h if absent). Use the strings
-    exactly as returned.
+    matching the recommendation's proposal.duration_hours: sim_now_plus_24h or
+    sim_now_plus_72h (default 24h if absent). Use the strings exactly as returned.
   STEP 2 (find via MCP): promotion_recommendations, database "restaurant_gm",
     filter { "recommendation_id": "<id>", "status": "approved" }
   STEP 3 (insert-many on promotions):
@@ -122,7 +140,7 @@ instruction: |
     "applies_to_item_ids", "target_criteria":   <all copied from the recommendation>,
     "status": "live",
     "valid_from": "<sim_now>",
-    "valid_until": "<sim_now_plus_2h | _24h | _72h per proposal.duration_hours>",
+    "valid_until": "<sim_now_plus_24h | sim_now_plus_72h per proposal.duration_hours>",
     "predicted_uptake": <from justification.predictive>,
     "redemption_count": 0,
     "approved_by": "<recommendation.decided_by>",

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import Chat from './Chat.jsx'
 import Md from './Markdown.jsx'
 import { useFeed } from './useFeed.js'
-import { fmtMoney, fmtSimTime, fmtDay, itemName, ingName, vendorName, pct } from './lib.js'
+import { fmtMoney, fmtSimTime, fmtDay, itemName, ingName, vendorName, pct, prettyMetric, prettyValue } from './lib.js'
 
 export default function App() {
   const feed = useFeed()
@@ -10,7 +10,7 @@ export default function App() {
     <div className="shell">
       <Toasts notifications={feed.notifications} onDismiss={feed.dismiss} />
       <header className="topbar">
-        <div className="brand">🌮 Restaurant GM</div>
+        <div className="brand">Restaurant GM</div>
         <div className="topbar-right">
           <SimControl onDayStart={feed.setSimNow} />
           <span className="sim-clock">sim {fmtSimTime(feed.sim_now)}</span>
@@ -107,13 +107,13 @@ function SimControl({ onDayStart }) {
           <option value={20}>1 day ≈ 20 min</option>
         </select>
       )}
-      {!running && <button className="sim-btn" onClick={start}>▶ Run a day</button>}
+      {!running && <button className="sim-btn" onClick={start}>Run a day</button>}
       {running && (
         <>
           <button className="sim-btn pause" onClick={togglePause}>
-            {paused ? '▶ Resume' : '⏸ Pause'}
+            {paused ? 'Resume' : 'Pause'}
           </button>
-          <button className="sim-btn stop" onClick={stop}>⏹ Stop</button>
+          <button className="sim-btn stop" onClick={stop}>Stop</button>
           <span className={`sim-running ${paused ? 'paused' : ''}`}>
             {paused ? 'paused'
               : warming ? 'starting up — orders begin streaming in a few seconds…'
@@ -138,7 +138,7 @@ function OrderStream({ orders }) {
         return (
           <div key={o.order_id} className="order-row">
             <span className="order-time">{fmtSimTime(o.opened_at)}</span>
-            <span className="order-channel">{o.channel === 'DINE_IN' ? '🍽' : '🥡'}</span>
+            <span className="order-channel">{o.channel === 'DINE_IN' ? 'DINE-IN' : 'TO-GO'}</span>
             <span className="order-items" title={items}>{items}</span>
             {redeemed && <span className="pill target">🎟 promo</span>}
             <b className="order-net">{fmtMoney(o.net_amount_money)}</b>
@@ -161,8 +161,8 @@ function Toasts({ notifications, onDismiss }) {
   return (
     <div className="toasts">
       {notifications.slice(-4).map((n) => (
-        <div key={n.id} className="toast" onClick={() => onDismiss(n.id)}>
-          <span className="toast-icon">{n.icon}</span>
+        <div key={n.id} className={`toast ${n.tone || ''}`} onClick={() => onDismiss(n.id)}>
+          <span className="toast-tag">{n.tag}</span>
           <span>{n.text}</span>
         </div>
       ))}
@@ -170,23 +170,19 @@ function Toasts({ notifications, onDismiss }) {
   )
 }
 
-const AGENT_ICONS = {
-  inventory: '📦', billing: '💳', outreach: '📣', order_mgmt: '📈', central: '🧠',
-}
-
 function AgentActivity({ events }) {
   if (events.length === 0) return null
   return (
     <div className="panel">
       <div className="panel-title">Agent activity <span className="muted">(autonomous actions, in the agent's own words)</span></div>
-      {events.slice(0, 6).map((e) => (
+      <div className="activity-scroll">
+      {events.map((e) => (
         <div key={e.event_id} className="activity-row">
-          <span className="activity-icon">
-            {e.phase === 'started' ? '⚙️' : AGENT_ICONS[e.agent] || '🤖'}
+          <span className={`agent-tag ${e.phase === 'started' ? 'working' : ''}`}>
+            {e.phase === 'started' ? 'working' : e.agent}
           </span>
           <div className="activity-body">
             <div className="activity-head">
-              <b>{e.phase === 'started' ? 'working' : `${e.agent} agent`}</b>
               <span className="pill">{e.action?.replaceAll('_', ' ')}</span>
               <span className="muted activity-time">{fmtSimTime(e.created_at)}</span>
             </div>
@@ -196,6 +192,7 @@ function AgentActivity({ events }) {
           </div>
         </div>
       ))}
+      </div>
     </div>
   )
 }
@@ -246,12 +243,11 @@ function PromoSection({ recommendations, promotions, sends }) {
   const live = promotions.filter((p) => p.status === 'live')
   const past = promotions.filter((p) => p.status !== 'live').slice(0, 4)
   // A recommendation pill only lingers up top while it has NO promo yet
-  // (rejected, or approved-and-still-configuring). Once the promo exists its
-  // whole story lives on the live card / in Past promos.
-  const configured = new Set(promotions.map((p) => p.recommendation_id))
+  // (rejected, or approved-and-still-configuring). The rec doc itself carries
+  // resulting_promo_id, so don't cross-reference the (limited) promotions list.
   const decided = recommendations.filter(
     (r) => r.status === 'rejected' ||
-      (r.status === 'approved' && !configured.has(r.recommendation_id))
+      (r.status === 'approved' && !r.resulting_promo_id)
   ).slice(0, 5)
   const expandedRec = decided.find((r) => r.recommendation_id === expandedId)
   return (
@@ -283,41 +279,42 @@ function PromoSection({ recommendations, promotions, sends }) {
       {expandedRec && <PromoDetail rec={expandedRec} promo={null} />}
       {past.length > 0 && (
         <div className="past-promos">
-          <div className="stock-head">Past promos ({past.length}) — click to expand</div>
+          <div className="stock-head">Past promos ({past.length}) — click for full insights</div>
           {past.map((p) => (
-            <div key={p.promo_id}>
-              <button
-                className={`past-promo-row clickable ${expandedId === p.promo_id ? 'open' : ''}`}
-                onClick={() => setExpandedId(expandedId === p.promo_id ? null : p.promo_id)}
-              >
-                <span>{expandedId === p.promo_id ? '▾' : '▸'} {p.title}</span>
-                <span className="pill">{p.discount_value}% off</span>
-                <span className="muted">{fmtSimTime(p.valid_from)} – {fmtSimTime(p.valid_until)}</span>
-                <span className="redemptions">{uptakeLine(p)}</span>
-              </button>
-              {expandedId === p.promo_id && (
-                <PromoDetail
-                  rec={recommendations.find((r) => r.recommendation_id === p.recommendation_id)}
-                  promo={p}
-                />
-              )}
-            </div>
+            <button key={p.promo_id} className="past-promo-row clickable"
+              onClick={() => setExpandedId(p.promo_id)}>
+              <span>{p.title}</span>
+              <span className="pill">{p.discount_value}% off</span>
+              <span className="muted">{fmtSimTime(p.valid_from)} – {fmtSimTime(p.valid_until)}</span>
+              <span className="redemptions">{uptakeLine(p)}</span>
+            </button>
           ))}
         </div>
       )}
+      {(() => {
+        const p = past.find((x) => x.promo_id === expandedId)
+        return p ? (
+          <PromoModal promo={p}
+            rec={recommendations.find((r) => r.recommendation_id === p.recommendation_id)}
+            onClose={() => setExpandedId(null)} />
+        ) : null
+      })()}
     </div>
   )
 }
 
-// target_criteria -> human-readable pills ("silver/gold", "price sens ≤ 0.6", …)
+// target_criteria -> human-readable pills. Empty criteria = OPEN promo (anyone,
+// walk-ins included, can redeem); the opt-in rule only governs who gets
+// NOTIFIED, so it is not shown as a targeting pill.
 function CriteriaPills({ criteria }) {
-  if (!criteria) return null
   const pills = []
-  if (criteria.loyalty_tier?.length) pills.push(`${criteria.loyalty_tier.join(' / ')} loyalty`)
-  if (criteria.max_price_sensitivity != null) pills.push(`price sensitivity ≤ ${criteria.max_price_sensitivity}`)
-  if (criteria.city) pills.push(`📍 ${criteria.city}`)
-  if (criteria.dietary_flags?.length) pills.push(criteria.dietary_flags.join(' / '))
-  pills.push('opted-in only')
+  const c = criteria || {}
+  if (c.loyalty_tier?.length) pills.push(`${c.loyalty_tier.join(' / ')} loyalty`)
+  if (c.max_price_sensitivity != null) pills.push(`price sensitivity ≤ ${c.max_price_sensitivity}`)
+  if (c.city) pills.push(c.city)
+  if (c.dietary_flags?.length) pills.push(c.dietary_flags.join(' / '))
+  if (c.favorite_item_ids?.length) pills.push('fans of the promoted items')
+  if (pills.length === 0) pills.push('open to everyone, walk-ins included')
   return (
     <span className="pill-row inline">
       {pills.map((p) => <span key={p} className="pill target">{p}</span>)}
@@ -370,7 +367,7 @@ function RecommendationCard({ rec }) {
       <ul className="rec-evidence">
         {(just.analytical || []).map((a, i) => (
           <li key={i}>
-            <b>{a.metric}:</b> {a.value}
+            <b>{prettyMetric(a.metric)}:</b> {prettyValue(a.metric, a.value)}
             <span className="source"> · {a.source_table}</span>
             {a.note ? <span className="note"> — {a.note}</span> : null}
           </li>
@@ -389,6 +386,137 @@ function RecommendationCard({ rec }) {
         <button className="reject" disabled={busy} onClick={() => decide('rejected')}>
           ✕ Reject
         </button>
+      </div>
+    </div>
+  )
+}
+
+// Measured post-mortem panel for a finished promo: conversion of notified,
+// actual vs predicted, who redeemed, demand lift — plus ✨ Analyze (a Gemini
+// narrative grounded exclusively in these numbers).
+function PromoInsights({ promoId }) {
+  const [data, setData] = useState(null)
+  const [analysis, setAnalysis] = useState(null)
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    fetch(`/api/promos/${promoId}/insights`)
+      .then((r) => r.json()).then(setData).catch(() => {})
+  }, [promoId])
+
+  async function analyze() {
+    setBusy(true)
+    try {
+      const r = await fetch(`/api/promos/${promoId}/analyze`, { method: 'POST' })
+      const j = await r.json()
+      setAnalysis(j.analysis || j.detail || 'analysis unavailable')
+    } catch {
+      setAnalysis('analysis unavailable')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (!data) return <div className="muted">loading insights…</div>
+  const d = data.redeemer_demographics || {}
+  return (
+    <div className="insights">
+      <div className="insight-grid">
+        <Stat label="Notified → redeemed" value={
+          data.conversion_of_notified_pct != null
+            ? `${data.notified_redeemed}/${data.notified} (${data.conversion_of_notified_pct}%)` : '—'} />
+        <Stat label="Actual vs predicted uptake"
+          value={`${data.actual_uptake_pct ?? '—'}% vs ${data.predicted_uptake_pct ?? '—'}%`}
+          tone={data.actual_uptake_pct >= data.predicted_uptake_pct ? 'good' : 'bad'} />
+        <Stat label="Walk-in redemptions" value={data.walk_in_redemptions} />
+        <Stat label="Item demand lift" value={
+          data.demand_lift?.lift_pct != null ? pct(data.demand_lift.lift_pct) : '—'}
+          tone={data.demand_lift?.lift_pct > 0 ? 'good' : ''} />
+        <Stat label="Promo revenue / discount given"
+          value={`${fmtMoney(data.promo_line_revenue_cents)} / ${fmtMoney(data.discount_given_cents)}`} />
+      </div>
+      <div className="stock-head" style={{ marginTop: 10 }}>
+        Who redeemed
+        {d.avg_price_sensitivity != null &&
+          <span className="muted"> (avg price sensitivity {d.avg_price_sensitivity})</span>}
+      </div>
+      <div className="demo-grid">
+        <DistList title="Loyalty tier" data={d.loyalty_tiers} />
+        <DistList title="Age band" data={d.age_bands} />
+        <DistList title="City" data={d.cities} />
+      </div>
+      {!analysis && (
+        <button className="analyze-btn" onClick={analyze} disabled={busy}>
+          {busy ? 'Analyzing…' : 'Analyze this promo'}
+        </button>
+      )}
+      {analysis && <div className="analysis"><Md text={analysis} /></div>}
+    </div>
+  )
+}
+
+// Tiny horizontal-bar distribution ("gold ▮▮▮▮ 7")
+function DistList({ title, data }) {
+  const entries = Object.entries(data || {}).sort((a, b) => b[1] - a[1]).slice(0, 5)
+  const max = entries[0]?.[1] || 1
+  return (
+    <div className="dist">
+      <div className="dist-title">{title}</div>
+      {entries.length === 0 && <div className="muted">no known redeemers</div>}
+      {entries.map(([k, v]) => (
+        <div key={k} className="dist-row">
+          <span className="dist-label">{k}</span>
+          <span className="dist-bar"><span style={{ width: `${(v / max) * 100}%` }} /></span>
+          <span className="dist-n">{v}</span>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+// Full-screen modal for a finished promo — the glanceable post-mortem window.
+function PromoModal({ promo, rec, onClose }) {
+  useEffect(() => {
+    const onKey = (e) => e.key === 'Escape' && onClose()
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+  const p = rec?.proposal || {}
+  const just = rec?.justification || {}
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+        <div className="rec-head">
+          <div>
+            <div className="rec-title">{promo.title}</div>
+            <div className="rec-desc">{promo.description}</div>
+          </div>
+          <div className="rec-right">
+            <div className="rec-discount">{promo.discount_value}% off</div>
+            <div className="rec-duration">
+              {fmtSimTime(promo.valid_from)} → {fmtSimTime(promo.valid_until)} · {promo.status}
+            </div>
+          </div>
+          <button className="modal-close" onClick={onClose}>✕</button>
+        </div>
+        <div className="rec-meta">
+          <span className="meta-label">On:</span> <ItemPills ids={promo.applies_to_item_ids} />
+        </div>
+        <div className="rec-meta">
+          <span className="meta-label">Targets:</span> <CriteriaPills criteria={promo.target_criteria} />
+        </div>
+        {(just.analytical || []).length > 0 && (
+          <>
+            <div className="stock-head" style={{ marginTop: 10 }}>Original evidence</div>
+            <ul className="rec-evidence">
+              {just.analytical.map((a, i) => (
+                <li key={i}><b>{prettyMetric(a.metric)}:</b> {prettyValue(a.metric, a.value)}
+                  <span className="source"> · {a.source_table}</span></li>
+              ))}
+            </ul>
+          </>
+        )}
+        <PromoInsights promoId={promo.promo_id} />
       </div>
     </div>
   )
@@ -427,7 +555,7 @@ function PromoDetail({ rec, promo }) {
       <ul className="rec-evidence">
         {(just.analytical || []).map((a, i) => (
           <li key={i}>
-            <b>{a.metric}:</b> {a.value}
+            <b>{prettyMetric(a.metric)}:</b> {prettyValue(a.metric, a.value)}
             <span className="source"> · {a.source_table}</span>
             {a.note ? <span className="note"> — {a.note}</span> : null}
           </li>
@@ -440,6 +568,7 @@ function PromoDetail({ rec, promo }) {
           {' · '}{uptakeLine(promo)}
         </> : rec?.status === 'approved' ? ' · promo configuring…' : null}
       </div>
+      {promo && promo.status !== 'live' && <PromoInsights promoId={promo.promo_id} />}
     </div>
   )
 }
@@ -469,6 +598,9 @@ function LivePromo({ promo }) {
         live {fmtSimTime(promo.valid_from)} → {fmtSimTime(promo.valid_until)}
         {' · '}{uptakeLine(promo)}
         {' · '}approved by <b>{promo.approved_by || '—'}</b>
+        {!promo.notified_count && (
+          <span className="sim-running"> · notifying customers…</span>
+        )}
       </div>
     </div>
   )
@@ -514,7 +646,7 @@ function StockPanel({ lm, ingredients = [], pos = [], wasteCents = 0 }) {
         Stock & supply
         {wasteCents > 0 && (
           <span className="pill warn" title="spoilage cost, trailing 7 sim-days">
-            🗑 {fmtMoney(wasteCents)} wasted (7d)
+            {fmtMoney(wasteCents)} wasted (7d)
           </span>
         )}
       </div>
@@ -595,6 +727,7 @@ function POPanel({ pos }) {
         Purchase orders
         {open.length > 0 && <span className="pill warn">{open.length} open</span>}
       </div>
+      <div className="po-scroll">
       <table className="po-table">
         <thead>
           <tr><th>Status</th><th>Vendor</th><th>Items</th><th>Placed</th><th>ETA / received</th><th>Total</th></tr>
@@ -619,6 +752,7 @@ function POPanel({ pos }) {
           ))}
         </tbody>
       </table>
+      </div>
     </div>
   )
 }
