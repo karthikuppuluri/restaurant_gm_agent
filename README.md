@@ -6,6 +6,16 @@ Built for the **Google Cloud Rapid Agent Hackathon**, MongoDB partner track.
 
 ---
 
+## Try it live
+
+**Hosted URL**: https://restaurant-gm-app-827886453598.us-central1.run.app
+
+1. Click ▶ in the top bar to simulate a service day (~2 min). Watch orders tick in, stock deplete, and agents fire in the activity feed.
+2. When a promo recommendation appears, click it to see the full evidence and justification, then click **Approve**. Outreach notifies customers and redemptions show up on orders marked with 🎟.
+3. Ask the agents anything in the chat panel — "what's running low?", "how are sales today?", "should we run a promo?"
+
+---
+
 ## What it does
 
 - **Live dashboard**: order stream, shift revenue and covers, cash on hand, daily P&L, live inventory with spoilage tracking, purchase orders, and an agent activity feed in the agents' own words.
