@@ -130,15 +130,64 @@ flowchart TB
 
 ---
 
+## Trying the hosted demo
+
+The easiest way to evaluate the project is the live hosted URL — no setup required.
+
+**Hosted URL**: https://restaurant-gm-app-827886453598.us-central1.run.app
+
+### What to try
+
+1. **Run the simulator** — click the ▶ button in the top bar to simulate a service day (~2 min real time). Watch orders tick in, stock deplete, and agents fire in the activity feed on the right.
+2. **Watch autonomous inventory** — after a few sim days, the inventory agent will place purchase orders automatically. They appear in the Purchase Orders panel with the agent's reasoning.
+3. **Approve a promo** — when the billing agent spots an opportunity (surplus stock or pace deviation), a recommendation card appears in the Promotions panel. Click it to see the full evidence and justification, then click **Approve**. The outreach agent will notify customers and redemptions will appear on incoming orders marked with 🎟.
+4. **Ask the agents** — use the chat panel on the right to ask questions like "what's running low?", "how are sales today?", or "should we run a promo?".
+
+---
+
 ## Running locally
 
+### Prerequisites
+
+- Python 3.11+
+- Node.js 20+ (for the MongoDB MCP server)
+- MongoDB Atlas cluster (free tier works)
+- Google Cloud project with Vertex AI enabled and a service account key
+
+### Setup
+
 ```bash
+git clone https://github.com/karthikuppuluri/restaurant_gm_agent
+cd restaurant_gm_agent
 pip install -r requirements.txt
-cp .env.example .env          # fill MONGODB_CONNECTION_STRING, GOOGLE_API_KEY
-python seed_data.py           # populate Atlas with simulated data
-python -m plumbing.launcher   # start all plumbing listeners
-adk web                       # dev UI at localhost:8000
+cp .env.example .env
 ```
+
+Fill in `.env`:
+
+```
+MONGODB_CONNECTION_STRING=mongodb+srv://...
+GOOGLE_API_KEY=...
+GOOGLE_CLOUD_PROJECT=...
+GOOGLE_CLOUD_LOCATION=global
+```
+
+### Seed the database
+
+```bash
+python seed_data.py
+```
+
+This populates Atlas with a simulated restaurant: menu, ingredients, recipes, customers, vendors, and a few weeks of historical orders.
+
+### Start the backend
+
+```bash
+python -m plumbing.launcher &   # change stream listeners + agent trigger worker
+adk web                          # FastAPI + dashboard at localhost:8000
+```
+
+Open http://localhost:8000 and use the ▶ simulator button to start a day.
 
 The MongoDB MCP server runs via `npx` (Node required alongside Python).
 
