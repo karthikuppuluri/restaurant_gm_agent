@@ -1,0 +1,14 @@
+# Never upload secrets or local state to Cloud Build.
+.env
+.git/
+.gitignore
+logs/
+.claude/
+restaurant_gm/.adk/
+__pycache__/
+**/__pycache__/
+*.pyc
+dashboard/node_modules/
+dashboard/dist/
+uv.lock
+*.excalidraw
